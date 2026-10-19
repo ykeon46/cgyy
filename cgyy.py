@@ -137,16 +137,7 @@ class VenueClient:
         try:
             self.page.goto(BASE_URL + '/venue/venue-introduce', wait_until='domcontentloaded', timeout=15000)
             self.page.get_by_text('退出', exact=True).wait_for(timeout=5000)
-            confirmed = self.page.evaluate('''user => new Promise(resolve => {
-                const timer = setTimeout(() => resolve(false), 5000);
-                const done = result => { clearTimeout(timer); resolve(result); };
-                const element = [...document.querySelectorAll('*')].find(e =>
-                    e.__vue__?.commonMethods?.emitAjax && e.__vue__?.userInfo?.username);
-                const vm = element?.__vue__;
-                if (!vm || String(vm.userInfo.username) !== user) return done(false);
-                vm.commonMethods.emitAjax({path:'/api/buddies', notPopUp:true,
-                    success:() => done(true), error:() => done(false)});
-            })''', user)
+            confirmed = self.check_session(user)
             if confirmed:
                 self.dismiss_notices()
                 LOG.info('已复用本机登录态，服务器校验通过（%.3f 秒）。', time.monotonic() - started)
@@ -155,6 +146,22 @@ class VenueClient:
             pass
         LOG.info('缓存登录态未通过校验，将重新登录。')
         return False
+
+    def check_session(self, user: str) -> bool:
+        """只读核验当前页面登录态，不离开已准备的预约页面。"""
+        try:
+            return bool(self.page.evaluate('''user => new Promise(resolve => {
+                const timer = setTimeout(() => resolve(false), 5000);
+                const done = result => { clearTimeout(timer); resolve(result); };
+                const element = [...document.querySelectorAll('*')].find(e =>
+                    e.__vue__?.commonMethods?.emitAjax && e.__vue__?.userInfo?.username);
+                const vm = element?.__vue__;
+                if (!vm || String(vm.userInfo.username) !== user) return done(false);
+                vm.commonMethods.emitAjax({path:'/api/buddies', notPopUp:true,
+                    success:() => done(true), error:() => done(false)});
+            })''', user))
+        except BrowserError:
+            return False
 
     def dismiss_notices(self) -> None:
         for _ in range(4):

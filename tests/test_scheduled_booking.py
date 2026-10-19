@@ -11,7 +11,7 @@ if sys.platform != 'linux':
     raise unittest.SkipTest('Linux systemd 后台预约任务')
 
 from cgyy import CHINA, DEFAULT_CONFIG, ReservationError, load_config
-from scheduled_booking import BookingJob, main
+from scheduled_booking import BookingJob, daily_config, main
 from payment import PaymentError, PaymentSettings
 from decimal import Decimal
 
@@ -70,16 +70,61 @@ class ScheduledBookingTests(unittest.TestCase):
 
     def test_fast_job_prepares_and_waits_before_its_first_scan(self):
         self.job.fast = True
-        first_context, ready_context = MagicMock(), MagicMock()
-        ready_client = MagicMock()
-        with patch.object(self.job,'login',side_effect=[(first_context,self.client),(ready_context,ready_client)]), \
+        context = MagicMock()
+        with patch.object(self.job,'login',return_value=(context,self.client)) as login, \
+                patch.object(self.job,'keep_session_until',return_value=(context,self.client)) as keep, \
                 patch.object(self.job,'scan',return_value=True) as scan, \
                 patch('scheduled_booking.sleep_until') as wait, patch('scheduled_booking.datetime') as clock:
             clock.now.return_value=datetime(2026,10,19,6,tzinfo=CHINA)
             self.assertEqual(self.job.run(MagicMock(),'test-user','test-password'),0)
-        scan.assert_called_once_with(ready_client)
-        ready_client.prepare_booking.assert_called_once_with(self.job.desired)
+        login.assert_called_once()
+        scan.assert_called_once_with(self.client)
+        self.client.prepare_booking.assert_called_once_with(self.job.desired)
+        self.assertEqual(keep.call_count,2)
         self.assertEqual(wait.call_args.args,(self.job.release,))
+
+    def test_keeps_session_alive_and_reauthenticates_only_after_expiry(self):
+        now=[datetime(2026,10,19,6,5,tzinfo=CHINA)]
+        until=datetime(2026,10,19,6,16,tzinfo=CHINA)
+        first_context,new_context,new_client=MagicMock(),MagicMock(),MagicMock()
+        self.client.check_session.side_effect=[True,False]
+        new_client.check_session.return_value=True
+        self.job.login_state=MagicMock()
+        self.job.prepared_venue=self.config['venues'][0]
+        with patch('scheduled_booking.datetime') as clock, \
+                patch('scheduled_booking.sleep_until',side_effect=lambda target:now.__setitem__(0,target)), \
+                patch.object(self.job,'login',return_value=(new_context,new_client)) as login:
+            clock.now.side_effect=lambda zone:now[0]
+            result=self.job.keep_session_until(MagicMock(),first_context,self.client,'user','password',until)
+        self.assertEqual(result,(new_context,new_client))
+        login.assert_called_once()
+        first_context.close.assert_called_once()
+        self.assertIsNone(self.job.prepared_venue)
+        self.assertEqual(self.job.login_state.save.call_count,2)
+        self.client.submit.assert_not_called()
+        new_client.submit.assert_not_called()
+
+    def test_daily_defaults_roll_dates_and_keep_evening_slots(self):
+        config=load_config(DEFAULT_CONFIG)
+        planned=daily_config(config,datetime(2026,12,31,20,tzinfo=CHINA))
+        self.assertEqual(planned['start_at'],'2027-01-01T06:05:00+08:00')
+        self.assertEqual(planned['release_at'],'2027-01-01T07:00:00+08:00')
+        self.assertEqual(planned['reserve_date'],'2027-01-03')
+        self.assertEqual(planned['reserve_time'],[20,21])
+        self.assertEqual(len(planned['venues']),2)
+        self.assertFalse(any('沙河' in venue for venue in planned['venues']))
+
+    def test_daily_job_started_before_release_stays_on_current_day(self):
+        planned=daily_config(load_config(DEFAULT_CONFIG),datetime(2026,10,20,6,30,tzinfo=CHINA))
+        self.assertEqual(planned['start_at'],'2026-10-20T06:05:00+08:00')
+        self.assertEqual(planned['reserve_date'],'2026-10-22')
+
+    def test_daily_schedule_rejects_login_or_release_outside_requested_window(self):
+        for change in [{'login_at':'05:59:00'},{'release_at':'06:59:00'},{'keep_alive_seconds':0}]:
+            config=load_config(DEFAULT_CONFIG)
+            config['daily_schedule'].update(change)
+            with self.subTest(change=change), self.assertRaises(ReservationError):
+                daily_config(config,datetime(2026,10,20,tzinfo=CHINA))
 
     def test_uncertain_submission_stops_before_trying_other_venue(self):
         self.client.submit.side_effect = ReservationError('未收到订单响应')

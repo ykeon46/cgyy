@@ -1,8 +1,8 @@
-"""一次性后台预约：到点检查指定场馆，确认一个订单后停止，由账号本人付款。"""
+"""每日预约：6点后维持登录，7点预约学院路20:00–22:00，确认一个订单后停止。"""
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as wall_time
 import fcntl
 import json
 import logging
@@ -13,10 +13,33 @@ import time
 from urllib.parse import urlencode, urlparse
 
 from playwright.sync_api import Error as BrowserError, sync_playwright
-from cgyy import BASE_URL, CHINA, LOG, ReservationError, VenueClient, authenticated_client, available_choice, load_config, sleep_until, target_date
+from cgyy import BASE_URL, CHINA, DEFAULT_CONFIG, LOG, ReservationError, VenueClient, authenticated_client, available_choice, load_config, sleep_until, target_date
 from login_state import DEFAULT_SESSION_STATE, LoginState
 from payment import AlipayPayment, ExpectedOrder, PaymentError, PaymentSettings, check_previous_result
 from text_captcha import CaptchaError, TextCaptchaSolver
+
+
+def daily_config(config: dict, now: datetime | None = None) -> dict:
+    now = (now or datetime.now(CHINA)).astimezone(CHINA)
+    schedule = config.get('daily_schedule', {})
+    try:
+        times = [wall_time.fromisoformat(schedule.get(key, fallback)) for key, fallback in
+                 [('login_at','06:05:00'),('release_at','07:00:00'),('stop_at','08:00:00')]]
+        interval = int(schedule.get('keep_alive_seconds', 300))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise ReservationError('daily_schedule 时间应为 HH:MM:SS，登录检查间隔应为正整数。') from error
+    if (any(value.tzinfo is not None for value in times) or
+            not wall_time(6) < times[0] < times[1] == wall_time(7) < times[2] or interval < 30):
+        raise ReservationError('每日任务须在6点后、7点前登录，7点开放，之后截止；检查间隔至少30秒。')
+    day = now.date()
+    if now >= datetime.combine(day,times[2],CHINA):
+        day += timedelta(days=1)
+    result = dict(config)
+    for key,value in zip(['start_at','release_at','stop_at'],times):
+        result[key] = datetime.combine(day,value,CHINA).isoformat()
+    result['reserve_date'] = str(target_date(dict(config,reserve_date=None), day))
+    result['keep_alive_seconds'] = interval
+    return result
 
 
 class BookingJob:
@@ -38,6 +61,9 @@ class BookingJob:
         self.captcha_solver = captcha_solver
         self.prepared_venue = None
         self.login_state = login_state if login_state is not None else LoginState()
+        self.keep_alive_seconds = int(config.get('keep_alive_seconds', 300))
+        if self.keep_alive_seconds < 30:
+            raise ReservationError('登录检查间隔至少30秒。')
         venues = config.get('venues', [])
         if not venues or any(not v.startswith('学院路校区-') or not v.endswith('-羽毛球') for v in venues):
             raise ReservationError('此任务仅允许学院路校区羽毛球场，排除沙河。')
@@ -153,6 +179,20 @@ class BookingJob:
         return authenticated_client(browser, self.config, user, lambda:password, self.login_state,
                                     ignore_password_warning=True)
 
+    def keep_session_until(self, browser, context, client, user: str, password: str, until: datetime):
+        while datetime.now(CHINA) < until:
+            check_at = min(datetime.now(CHINA) + timedelta(seconds=self.keep_alive_seconds), until)
+            self.status('keeping_session', next_check_at=check_at.isoformat(), release_at=self.release.isoformat())
+            sleep_until(check_at)
+            if client.check_session(user):
+                self.login_state.save(context, user)
+                self.status('session_valid', checked_at=datetime.now(CHINA).isoformat())
+            else:
+                context.close()
+                context, client = self.login(browser, user, password)
+                self.prepared_venue = None
+        return context, client
+
     def run(self, browser, user: str, password: str) -> int:
         self.status('waiting_start')
         sleep_until(self.start)
@@ -165,10 +205,8 @@ class BookingJob:
                 return 0
             if datetime.now(CHINA) < self.release:
                 self.status('waiting_release', release_at=self.release.isoformat())
-                # 开放前重新验证登录态；仅失效时重新登录。
-                sleep_until(self.release - timedelta(minutes=5))
-                context.close()
-                context, client = self.login(browser, user, password)
+                context, client = self.keep_session_until(browser, context, client, user, password,
+                                                         self.release - timedelta(minutes=5))
                 if self.fast:
                     client.config = dict(self.config, venue=self.config['venues'][0])
                     client.prepare_booking(self.desired)
@@ -176,6 +214,13 @@ class BookingJob:
                     self.status('ready', venue=self.prepared_venue, release_at=self.release.isoformat())
                 else:
                     client.list_venues()
+                # 最后15秒前再检查；检查过程不离开已准备的场馆页面。
+                context, client = self.keep_session_until(browser, context, client, user, password,
+                                                         self.release - timedelta(seconds=15))
+                if self.fast and self.prepared_venue is None:
+                    client.config = dict(self.config, venue=self.config['venues'][0])
+                    client.prepare_booking(self.desired)
+                    self.prepared_venue = self.config['venues'][0]
                 sleep_until(self.release)
             while datetime.now(CHINA) < self.stop:
                 if self.scan(client):
@@ -195,12 +240,14 @@ class BookingJob:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', type=Path, required=True)
+    parser.add_argument('--config', type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument('--daily', action='store_true', help='按每日时间表运行，预约日期随运行日期滚动')
     parser.add_argument('--secret', type=Path)
-    parser.add_argument('--state', type=Path, required=True)
+    parser.add_argument('--state', type=Path, help='任务状态；每日模式默认按日期独立保存')
     parser.add_argument('--validate', action='store_true', help='只校验配置和运行环境，不访问网站')
     parser.add_argument('--fast', action='store_true', help='开放前准备场馆，开放后10秒下单预算，找到可用场地即停止翻页')
     parser.add_argument('--headed', action='store_true', help='使用有界面的标准 Chromium；服务器需 DISPLAY/Xvfb')
+    parser.add_argument('--browser-binary', default=os.getenv('CGYY_BROWSER_BINARY'), help='自定义 Chromium 路径')
     parser.add_argument('--session-state', type=Path, default=DEFAULT_SESSION_STATE, help='本机北航登录态缓存')
     parser.add_argument('--no-session-cache', action='store_true', help='禁用登录态缓存')
     parser.add_argument('--captcha-repo', type=Path, help='Text_select_captcha 本地仓库')
@@ -216,15 +263,27 @@ def main(argv=None):
     lock_file = None
     try:
         config = load_config(args.config)
+        daily = args.daily or not any(config.get(key) for key in ['start_at','release_at','stop_at'])
+        if daily:
+            config = daily_config(config)
+            args.fast = True
+        if args.browser_binary:
+            config['browser_binary'] = args.browser_binary
+        if args.state is None:
+            if not daily:
+                raise ReservationError('一次性任务请指定 --state。')
+            args.state = Path('artifacts/daily') / datetime.fromisoformat(config['start_at']).date().isoformat() / 'status.json'
         enabled = args.auto_pay or args.payment_preview
         settings = PaymentSettings.from_env(args.max_pay_amount, charge=args.auto_pay) if enabled else None
         job = BookingJob(config, args.state, payment_settings=settings, auto_pay=args.auto_pay, payment_preview=args.payment_preview, fast=args.fast,
                          login_state=LoginState(None if args.no_session_cache else args.session_state))
         if args.validate:
-            if not Path(config['browser_binary']).is_file():
+            if config.get('browser_binary') and not Path(config['browser_binary']).is_file():
                 raise ReservationError('指定浏览器不存在。')
             print(json.dumps({'start_at':job.start.isoformat(), 'reserve_date':str(job.desired),
-                              'hours':config['reserve_time'], 'venues':config['venues'], 'stop_at':job.stop.isoformat()}, ensure_ascii=False))
+                              'release_at':job.release.isoformat(), 'hours':config['reserve_time'], 'venues':config['venues'],
+                              'stop_at':job.stop.isoformat(), 'keep_alive_seconds':job.keep_alive_seconds,
+                              'state_path':str(args.state)}, ensure_ascii=False))
             return 0
         args.state.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         lock_file = (args.state.parent / 'execution.lock').open('w')
@@ -251,7 +310,9 @@ def main(argv=None):
         if not user:
             raise ReservationError('需要 BUAA_SSO_USER，或一次性登录凭据文件中的用户名。')
         with sync_playwright() as playwright:
-            options = {'headless':not args.headed, 'executable_path':config['browser_binary']}
+            options = {'headless':not args.headed}
+            if config.get('browser_binary'):
+                options['executable_path'] = config['browser_binary']
             if config.get('proxy'):
                 options['proxy'] = {'server':config['proxy']}
             browser = playwright.chromium.launch(**options)

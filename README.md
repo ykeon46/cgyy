@@ -89,7 +89,9 @@ python cgyy.py --config configs/local.yaml --date 2026-10-22 \
 | `venue` | 完整场馆名称或唯一匹配片段，建议先运行 `--list-venues` |
 | `reserve_date` | `YYYY-MM-DD`；命令行 `--date` 优先 |
 | `days_ahead` | `reserve_date` 为空时，预约北京时间今天之后几天，默认 2 |
-| `reserve_time` | 连续递增小时，例如 `[14, 15]` 为 14:00–16:00；目前支持整小时时段 |
+| `reserve_time` | 默认 `[20, 21]`，同一场地连续 20:00–22:00；目前支持整小时时段 |
+| `venues` | 每日任务的候选场馆，默认学院路主馆和副馆，不包含沙河 |
+| `daily_schedule` | 默认06:05登录、07:00开放、08:00截止，开放前每300秒检查登录态 |
 | `priority` | 优先尝试的场地编号，例如 `[3, 1, 2]`；随后检查页面上其他编号，不依赖表格行顺序。副馆实际为 17–24 号 |
 | `candidates` | 网页同伴列表序号，例如 `[1]`；无需同伴则填 `[]`；兼容旧 `candidate` 字段 |
 | `phone` | 页面要求手机号且未自动带出时填写，建议加引号 |
@@ -159,33 +161,49 @@ python cgyy.py --config configs/local.yaml --submit --auto-pay --headless \
 python -m unittest discover -s tests -v
 ```
 
-56 项回归测试使用本地页面和模拟接口，不访问真实账户或创建真实订单，付款测试中的请求也全部拦截在本地。覆盖金额/场馆/日期/场地/时段不一致、过期、收款方或表单目标异常、付款结果不明、并发及重复提交，以及快速查场、网站余票刷新、开放前等待和登录态保存/失效等情形。需要先安装 Chromium；自定义浏览器时可设置 `CGYY_BROWSER_BINARY`。
+60 项回归测试使用本地页面和模拟接口，不访问真实账户或创建真实订单，付款测试中的请求也全部拦截在本地。覆盖金额/场馆/日期/场地/时段不一致、过期、收款方或表单目标异常、付款结果不明、并发及重复提交，以及快速查场、网站余票刷新、开放前等待、跨年每日日期滚动和登录态保存/失效等情形。需要先安装 Chromium；自定义浏览器时可设置 `CGYY_BROWSER_BINARY`。
 
 2026-10-19 上午复核发现，旧优先级 `[1, ..., 12]` 会漏掉副馆 17–24 号候选，现已修复。同时新增逐场地查询日志 `queries.jsonl`、提交前网页读取失败的一次重试，以及网页内部导航和开放前预加载。当天早上的运行快照与日志保留原样，方便追查；修正不能证明当时副馆是否曾有空位。
 
-## Linux 一次性后台预约
+## Linux 每日后台预约
 
-`scheduled_booking.py` 可由 systemd 用户定时器运行：使用配置中的 `start_at`、`release_at`、`stop_at`，在指定时间开始检查，开放前等待并重新登录，开放后每轮间隔至少 30 秒检查允许的场馆。当前任务只允许学院路羽毛球场，排除沙河。一次任务只尝试提交一个订单；提交结果不明时停止，先由本人核对个人中心。
+默认规则：每天北京时间06:05复用登录态，开放前每5分钟只读核验一次，失效才重新登录；06:55准备预约页面，06:59:45前再核验，07:00开始查场和提交。仅选择学院路主馆或副馆的任一场地，同一场地连续20:00–22:00，排除沙河。预约日期沿用 `days_ahead: 2`，每天重新计算，例如10月20日运行时预约10月22日，不固定到某一天。
 
-后台任务支持无界面运行。订单确认后在受保护的输出目录保存订单号、付款入口和截图，由本人登录北航网站完成付款；它不会主动向本聊天发送通知。配置和结果保存在已被 Git 忽略的 `artifacts/` 内，一次性登录凭据保存在当前用户的运行目录，读取后删除。程序启动后机器和网络需要保持运行。
-
-新版后台程序也支持显式添加 `--payment-preview` 或 `--auto-pay`，以及 `--max-pay-amount`；默认仍由本人付款。学校登录可直接读取 `BUAA_SSO_USER`、`BUAA_SSO_PASSWORD`，也兼容原有 `--secret` 一次性文件。通过 systemd 启动时需在服务环境中提供变量，仅在另一终端 `export` 不会改变服务环境。付款异常后保留已有订单并停止其他场馆下单。此前一次性任务的运行快照和定时器保持原有配置，未启用自动扣款。
-
-后台任务使用 `--fast --headed --captcha-repo artifacts/Text_select_captcha` 可启用相同的提前准备、10 秒下单预算和验证码处理。`--headed` 需要运行环境提供 DISPLAY；仅添加 `--fast` 不会切换浏览器模式。快速任务在开放时间前不尝试提交订单，准备阶段的页面读取不会保留场地。现有定时器不会自动添加这些参数。
-
-本次已配置的任务：2026-10-19 06:00 开始，目标 2026-10-21 20:00–22:00，学院路主馆或副馆；尚未开放时等待 07:00，最晚尝试至 08:00。
+每日模式自动启用快速下单预算；一轮没有空位时每隔30秒再查，最晚08:00结束。一旦尝试提交，结果不明时停止核对，不换场馆重复下单；确认一笔订单后停止当天任务。订单、付款入口和截图按运行日期保存在 `artifacts/daily/YYYY-MM-DD/`，避免前一天的完成状态阻塞下一天。
 
 ```bash
-# 查看本次定时器和执行状态
-systemctl --user status cgyy-20261019.timer
-cat artifacts/booking-20261021/status.json
-tail -f artifacts/booking-20261021/run.log
+# 只核对下一次每日计划，不登录、不下单
+python scheduled_booking.py --daily --validate
 
-# 取消本次任务
-systemctl --user stop cgyy-20261019.timer cgyy-20261019.service
+# 当前运行环境已配置 Chromium、验证码模型及 Xvfb / xauth 时使用
+deploy/run_daily_booking.sh
 ```
 
-停止正在提交的程序可能留下已生成的订单，需先到网站核对，再决定是否重新运行。
+`deploy/run_daily_booking.sh` 读取本机 `.env`，使用有界面的 Chromium，通过 Xvfb 在服务器运行；可选的本机共享库等设置放在 `artifacts/runtime/environment.sh`。默认由本人在场馆倒计时内付款；脚本不会主动向本聊天发送通知。自动付款仍须显式添加 `--auto-pay` 和单笔金额上限。
+
+部署每天06:05启动的 systemd 用户定时器：
+
+```bash
+mkdir -p ~/.config/systemd/user
+python - <<'PY'
+from pathlib import Path
+project = Path.cwd()
+units = Path.home() / '.config/systemd/user'
+(units / 'cgyy-daily.service').write_text(
+    (project / 'deploy/cgyy-daily.service.in').read_text().replace('@PROJECT_ROOT@', str(project)))
+(units / 'cgyy-daily.timer').write_text((project / 'deploy/cgyy-daily.timer').read_text())
+PY
+systemctl --user daemon-reload
+systemctl --user enable --now cgyy-daily.timer
+systemctl --user list-timers cgyy-daily.timer
+journalctl --user -u cgyy-daily.service -f
+
+# 停止每日任务
+systemctl --user disable --now cgyy-daily.timer
+systemctl --user stop cgyy-daily.service
+```
+
+机器和网络需在任务期间运行。停止正在提交的程序可能留下已生成的订单，需先到网站核对，再决定是否重新运行。旧的一次性配置仍支持显式的 `start_at`、`release_at`、`stop_at` 和 `--state`；旧快照不会自动切换为每日计划。
 
 ## License
 
