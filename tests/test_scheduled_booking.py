@@ -1,0 +1,145 @@
+from datetime import date, datetime
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import MagicMock, patch
+from playwright.sync_api import TimeoutError as BrowserTimeout
+import sys
+
+if sys.platform != 'linux':
+    raise unittest.SkipTest('Linux systemd 后台预约任务')
+
+from cgyy import CHINA, DEFAULT_CONFIG, ReservationError, load_config
+from scheduled_booking import BookingJob, main
+from payment import PaymentError, PaymentSettings
+from decimal import Decimal
+
+
+class ScheduledBookingTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.config = dict(load_config(DEFAULT_CONFIG), reserve_date='2026-10-21', reserve_time=[20,21],
+            venues=['学院路校区-体育馆主馆-羽毛球','学院路校区-体育馆训练馆(副馆)-羽毛球'],
+            start_at='2026-10-19T06:00:00+08:00', release_at='2026-10-19T07:00:00+08:00', stop_at='2026-10-19T08:00:00+08:00')
+        with patch('scheduled_booking.target_date', return_value=date(2026,10,21)):
+            self.job = BookingJob(self.config, self.root/'status.json')
+        self.client = MagicMock()
+        self.choice = [{'court':'1号','start':'20:00','end':'21:00'}, {'court':'1号','start':'21:00','end':'22:00'}]
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_shahe_is_rejected(self):
+        self.config['venues'].append('沙河校区-综合馆-羽毛球')
+        with patch('scheduled_booking.target_date', return_value=date(2026,10,21)):
+            with self.assertRaisesRegex(ReservationError, '排除沙河'):
+                BookingJob(self.config, self.root/'status.json')
+
+    def test_falls_back_to_training_hall_and_stops_after_one_order(self):
+        self.client.submit.return_value = {'tradeNo':'example-trade'}
+        with patch('scheduled_booking.available_choice', side_effect=[[],self.choice]):
+            self.assertTrue(self.job.scan(self.client))
+        self.assertEqual(self.client.open_venue.call_count, 2)
+        self.client.submit.assert_called_once_with(self.choice)
+        state = json.loads(self.job.state_path.read_text())
+        self.assertEqual(state['status'], 'locked')
+        self.assertEqual(state['venue'], self.config['venues'][1])
+        with self.assertRaises(ReservationError):
+            self.job.scan(self.client)
+        self.assertEqual(self.client.submit.call_count, 1)
+
+    def test_fast_scan_refreshes_prepared_venue_and_passes_captcha_budget(self):
+        self.job.fast = True
+        self.job.prepared_venue = self.config['venues'][0]
+        self.job.captcha_solver = object()
+        self.client.find_choice.return_value = [dict(slot,classes=['free']) for slot in self.choice]
+        self.client.submit.return_value = {'tradeNo':'fast-test-order'}
+        self.assertTrue(self.job.scan(self.client))
+        self.client.refresh_availability.assert_called_once()
+        self.client.open_venue.assert_not_called()
+        self.client.inspect.assert_not_called()
+        options = self.client.submit.call_args.kwargs
+        self.assertGreater(options['timeout'], 0)
+        self.assertLessEqual(options['timeout'], 10000)
+        self.assertIs(options['captcha_solver'], self.job.captcha_solver)
+        state=json.loads(self.job.state_path.read_text())
+        self.assertEqual(state['status'], 'locked')
+        self.assertIn('booking_elapsed_seconds', state)
+
+    def test_fast_job_prepares_and_waits_before_its_first_scan(self):
+        self.job.fast = True
+        first_context, ready_context = MagicMock(), MagicMock()
+        ready_client = MagicMock()
+        with patch.object(self.job,'login',side_effect=[(first_context,self.client),(ready_context,ready_client)]), \
+                patch.object(self.job,'scan',return_value=True) as scan, \
+                patch('scheduled_booking.sleep_until') as wait, patch('scheduled_booking.datetime') as clock:
+            clock.now.return_value=datetime(2026,10,19,6,tzinfo=CHINA)
+            self.assertEqual(self.job.run(MagicMock(),'test-user','test-password'),0)
+        scan.assert_called_once_with(ready_client)
+        ready_client.prepare_booking.assert_called_once_with(self.job.desired)
+        self.assertEqual(wait.call_args.args,(self.job.release,))
+
+    def test_uncertain_submission_stops_before_trying_other_venue(self):
+        self.client.submit.side_effect = ReservationError('未收到订单响应')
+        with patch('scheduled_booking.available_choice', return_value=self.choice):
+            with self.assertRaises(ReservationError):
+                self.job.scan(self.client)
+        self.assertEqual(self.client.open_venue.call_count, 1)
+        self.assertEqual(self.client.submit.call_count, 1)
+        self.assertEqual(json.loads(self.job.state_path.read_text())['status'], 'needs_attention')
+
+    def test_unopened_date_never_submits(self):
+        self.client.choose_date.side_effect = ReservationError('尚未开放')
+        self.assertFalse(self.job.scan(self.client))
+        self.client.submit.assert_not_called()
+
+    def test_read_timeout_is_retried_before_submission(self):
+        self.client.open_venue.side_effect=[BrowserTimeout('read timeout'),None]
+        self.client.submit.return_value={'tradeNo':'example-trade'}
+        with patch('scheduled_booking.available_choice',return_value=self.choice):
+            self.assertTrue(self.job.scan(self.client))
+        self.assertEqual(self.client.open_venue.call_count,2)
+        self.assertEqual(self.job.read_failures,1)
+        self.client.submit.assert_called_once()
+
+    def test_query_log_saves_each_target_slot(self):
+        slots=[dict(slot, classes=['reserved'],text='已售') for slot in self.choice]
+        self.client.inspect.return_value=slots
+        with patch('scheduled_booking.available_choice',return_value=[]):
+            self.assertFalse(self.job.scan(self.client))
+        lines=(self.root/'queries.jsonl').read_text().splitlines()
+        self.assertEqual(len(lines),2)
+        self.assertEqual(json.loads(lines[0])['target_slots'][0]['classes'],['reserved'])
+
+    def test_rerun_preserves_locked_state_and_secret(self):
+        import yaml
+        config = self.root/'config.yaml'
+        config.write_text(yaml.safe_dump(self.config,allow_unicode=True))
+        secret = self.root/'secret.json'
+        secret.write_text('{}')
+        self.job.status('locked', trade_no='existing-order')
+        with patch('scheduled_booking.target_date', return_value=date(2026,10,21)):
+            result = main(['--config',str(config),'--state',str(self.job.state_path),'--secret',str(secret)])
+        self.assertEqual(result, 1)
+        self.assertEqual(json.loads(self.job.state_path.read_text())['status'], 'locked')
+        self.assertTrue(secret.exists())
+
+    def test_auto_payment_failure_preserves_order_and_stops_other_venues(self):
+        self.job.auto_pay=True
+        self.job.payment_settings=PaymentSettings(Decimal('100'),'fake-account','fake-secret')
+        choice=[dict(s,text='￥25.00') for s in self.choice]
+        self.client.submit.return_value={'tradeNo':'test-trade'}
+        with patch('scheduled_booking.available_choice',return_value=choice), patch('scheduled_booking.AlipayPayment') as factory:
+            factory.return_value.submitted=True
+            factory.return_value.run.side_effect=PaymentError('付款结果不明')
+            with self.assertRaises(PaymentError):
+                self.job.scan(self.client)
+        self.client.submit.assert_called_once()
+        self.assertEqual(self.job.order,{'tradeNo':'test-trade'})
+        self.assertEqual(json.loads(self.job.state_path.read_text())['status'],'payment_unknown')
+
+
+if __name__ == '__main__':
+    unittest.main()

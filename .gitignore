@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.py[cod]
+configs/local.yaml
+configs/*.local.yaml
+.env
+artifacts/
