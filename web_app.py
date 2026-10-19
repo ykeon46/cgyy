@@ -120,6 +120,24 @@ def apply_schedule(config,enabled):
     if enabled:subprocess.run(['systemctl','--user','restart','cgyy-daily.timer'],check=True,capture_output=True)
 
 
+def local_console_request(headers):
+    """Allow loopback forwarding ports; compare Origin with the browser's Host."""
+    if headers.get('X-CGYY-Client')!='1':return False
+    try:
+        host=headers.get('Host','')
+        target=urlparse('http://'+host)
+        if target.hostname not in {'localhost','127.0.0.1','::1'}:return False
+        if target.username is not None or target.password is not None or target.path or target.params or target.query or target.fragment:return False
+        port=target.port if target.port is not None else 80
+        if not 1<=port<=65535:return False
+        origin=headers.get('Origin')
+        if origin is None:return True
+        source=urlparse(origin)
+        return (source.scheme=='http' and source.netloc==target.netloc
+                and not (source.path or source.params or source.query or source.fragment))
+    except ValueError:return False
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args):pass
 
@@ -158,10 +176,8 @@ class Handler(BaseHTTPRequestHandler):
         self.json({'error':'未找到接口。'},404)
 
     def do_POST(self):
-        host=self.headers.get('Host','')
-        origin=self.headers.get('Origin')
-        if host not in {f'127.0.0.1:{self.server.server_port}',f'localhost:{self.server.server_port}'} or self.headers.get('X-CGYY-Client')!='1' or origin and origin not in {'http://'+host}:
-            self.json({'error':'请从本机控制台操作。'},403);return
+        if not local_console_request(self.headers):
+            self.json({'error':'请求来源校验失败，请刷新当前控制台页面后重试。'},403);return
         try:
             length=int(self.headers.get('Content-Length','0'))
             if not 0<length<=32768:raise ValueError('请求大小不正确。')

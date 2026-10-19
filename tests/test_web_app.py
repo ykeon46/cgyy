@@ -27,9 +27,29 @@ class WebTests(unittest.TestCase):
             with self.subTest(endpoint=endpoint),self.assertRaises(HTTPError) as error:urlopen(self.url+endpoint)
             self.assertEqual(error.exception.code,401)
     def test_mutations_reject_cross_origin_requests(self):
-        request=Request(self.url+'/api/login',data=b'{}',headers={'Content-Type':'application/json','Origin':'https://example.test'})
-        with self.assertRaises(HTTPError) as error:urlopen(request)
-        self.assertEqual(error.exception.code,403)
+        cases=[
+            {'Host':'localhost:50293','Origin':'https://example.test','X-CGYY-Client':'1'},
+            {'Host':'localhost:50293','Origin':'http://localhost:8765','X-CGYY-Client':'1'},
+            {'Host':'example.test:50293','Origin':'http://example.test:50293','X-CGYY-Client':'1'},
+            {'Host':'localhost:50293','Origin':'null','X-CGYY-Client':'1'},
+            {'Host':'localhost:50293','Origin':'http://localhost:50293'},
+        ]
+        with patch('web_app.spawn_worker') as worker:
+            for headers in cases:
+                request=Request(self.url+'/api/login',data=b'{}',headers={'Content-Type':'application/json',**headers})
+                with self.subTest(headers=headers),self.assertRaises(HTTPError) as error:urlopen(request)
+                self.assertEqual(error.exception.code,403)
+            worker.assert_not_called()
+    def test_login_accepts_same_origin_on_a_forwarded_local_port(self):
+        with patch.dict(web_app.SESSIONS,{},clear=True),patch('web_app.spawn_worker',return_value={'username':'forward-test','buddies':[]}) as worker:
+            request=Request(self.url+'/api/login',data=json.dumps({'username':'forward-test','password':'test-password'}).encode(),headers={
+                'Content-Type':'application/json','X-CGYY-Client':'1',
+                'Host':'localhost:50293','Origin':'http://localhost:50293',
+            })
+            with urlopen(request) as response:
+                self.assertEqual(json.load(response)['session']['username'],'forward-test')
+                self.assertIn('HttpOnly',response.headers.get('Set-Cookie'))
+            worker.assert_called_once()
     def test_configuration_excludes_credentials_and_rejects_shahe(self):
         config=web_app.validate_config({'password':'must-not-save','venues':web_app.load_config(web_app.DEFAULT_CONFIG)['venues']})
         self.assertNotIn('password',config)
