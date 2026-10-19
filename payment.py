@@ -4,9 +4,12 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import base64
+import logging
+from io import BytesIO
 import re
 import time
 from urllib.parse import urlparse
+from playwright.sync_api import Error as BrowserError
 
 class PaymentError(ValueError):
     pass
@@ -88,10 +91,50 @@ READ_ORDER = r'''tradeNo => new Promise(resolve => {
 
 
 class CampusQRCode:
-    def __init__(self, page, expected: ExpectedOrder):
+    def __init__(self, page, expected: ExpectedOrder, *, direct=True):
         self.page = page
         self.expected = expected
         self.requested = False
+        self.direct = direct
+
+    def alipay_qr(self, cashier_url, expires_at):
+        """Read the official transaction QR; never open or submit account/password forms."""
+        deadline = min(time.monotonic()+12, time.monotonic()+
+                       (expires_at-datetime.now().astimezone()).total_seconds()-5)
+        def timeout():
+            remaining = int((deadline-time.monotonic())*1000)
+            if remaining<=0:raise PaymentError('获取支付宝交易码超时。')
+            return remaining
+        cashier = self.page.context.new_page()
+        try:
+            cashier.goto(cashier_url,wait_until='domcontentloaded',timeout=timeout())
+            if urlparse(cashier.url).scheme!='https' or urlparse(cashier.url).netloc!='cashier.cc-pay.cn':
+                raise PaymentError('校园付收银台需要额外登录。')
+            cashier.locator('svg').filter(has=cashier.locator('use[*|href="#iconzhifubaozhifu1"]')).click(timeout=timeout())
+            cashier.wait_for_url(re.compile(r'https://(?:excashier|cashier)\.alipay\.com/'),
+                                 wait_until='domcontentloaded',timeout=timeout())
+            parsed=urlparse(cashier.url)
+            if parsed.scheme!='https' or parsed.hostname not in {'excashier.alipay.com','cashier.alipay.com'}:
+                raise PaymentError('支付宝交易页面域名异常。')
+            field=cashier.locator('#J_qrCode')
+            field.wait_for(state='attached',timeout=timeout())
+            target=field.input_value(timeout=timeout())
+            if len(target)>2048 or urlparse(target).scheme!='https' or urlparse(target).netloc!='qr.alipay.com':
+                raise PaymentError('未找到支付宝原生交易付款码。')
+            if not cashier.get_by_text('北京航空航天大学',exact=True).count():
+                raise PaymentError('支付宝收款方不一致。')
+            fee=cashier.locator('.order-amount').first.inner_text(timeout=timeout())
+            if amount(re.sub(r'[¥￥\s,]','',fee))!=self.expected.fee:
+                raise PaymentError('支付宝交易金额不一致。')
+            # 使用官方页面给出的交易地址生成带留白的清晰二维码，不依赖网页
+            # 小尺寸 canvas 的绘制时序，也不会把网页登录码当作付款交易码。
+            import qrcode
+            image=qrcode.make(target,box_size=8,border=4)
+            output=BytesIO();image.save(output,format='PNG')
+            self.expected.verify(self.read_order())
+            return 'data:image/png;base64,'+base64.b64encode(output.getvalue()).decode()
+        finally:
+            cashier.close()
 
     def read_order(self):
         if urlparse(self.page.url).hostname != 'cgyy.buaa.edu.cn':
@@ -151,8 +194,18 @@ class CampusQRCode:
         mime='image/png' if png.startswith(b'\x89PNG\r\n\x1a\n') else 'image/jpeg' if png.startswith(b'\xff\xd8\xff') else None
         if not mime or len(png) > 1024 * 1024:
             raise PaymentError('官方未返回有效的二维码图片。')
-        return {'qr_code':'data:'+mime+';base64,'+raw,'cashier_url':result['schoolPayUrl'],
-                'expires_at':expires_at.isoformat(),'amount':str(self.expected.fee)}
+        qr={'qr_code':'data:'+mime+';base64,'+raw,'cashier_url':result['schoolPayUrl'],
+            'expires_at':expires_at.isoformat(),'amount':str(self.expected.fee),
+            'qr_kind':'campus_cashier','scan_tip':'校园付收银台入口，扫码后按官方页面选择支付方式，可能需要登录。'}
+        if self.direct:
+            try:
+                qr['qr_code']=self.alipay_qr(result['schoolPayUrl'],expires_at)
+                qr.update(qr_kind='alipay_payment',scan_tip='请使用已登录的手机支付宝扫码，在手机上确认付款。')
+            except (BrowserError,PaymentError,ImportError,ValueError) as error:
+                reason=str(error) if isinstance(error,PaymentError) else type(error).__name__
+                logging.getLogger('cgyy').warning('未获取到已核对的支付宝交易码，返回校园付收银台入口（%s）。',reason)
+                self.expected.verify(self.read_order())
+        return qr
 
     def wait_for_payment(self, expires_at: str, update):
         deadline = datetime.fromisoformat(expires_at)

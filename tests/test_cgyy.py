@@ -3,12 +3,14 @@ from datetime import date, datetime
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
 
 import yaml
 from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as BrowserTimeout
 
 from cgyy import DEFAULT_CONFIG, ReservationError, SubmissionRejected, VenueClient, available_choice, load_config, target_date
 
@@ -150,6 +152,28 @@ class BrowserTests(unittest.TestCase):
         self.assertEqual(self.client.list_venues(), ['测试场馆'])
         self.assertEqual(len(self.requests), requests_before)
 
+    def test_missing_venue_page_respects_read_budget(self):
+        started=time.monotonic()
+        with self.assertRaises(BrowserTimeout):
+            with self.client.reading_until(started+.25):
+                self.client.list_venues()
+        self.assertLess(time.monotonic()-started,1.5)
+        self.assertIsNone(self.client.read_deadline)
+        self.assertFalse(any(method=='POST' for method,_ in self.requests))
+
+    def test_venue_navigation_does_not_wait_for_unrelated_page_assets(self):
+        pending=[]
+        self.page.route('**/hanging-image',lambda route:pending.append(route))
+        self.page.route('**/navigation-hang',lambda route:route.fulfill(content_type='text/html',body='''
+            <meta charset="utf-8"><img src="/hanging-image">
+            <div class="tabItem" onclick="history.pushState({},'', '/venue/venue-introduce');
+                document.body.insertAdjacentHTML('beforeend','<div class=place-item><h5>测试场馆</h5></div>')">场地预约</div>
+        '''))
+        self.page.goto('https://cgyy.buaa.edu.cn/navigation-hang',wait_until='domcontentloaded')
+        with self.client.reading_until(time.monotonic()+1):
+            self.assertEqual(self.client.list_venues(),['测试场馆'])
+        for route in pending:route.abort()
+
     def test_date_change_waits_for_actual_api_prefix(self):
         self.client.choose_date(date(2026,10,20))
         self.assertIn('10月20日', self.page.locator('.date_box .active').inner_text())
@@ -228,7 +252,7 @@ class BrowserTests(unittest.TestCase):
 
     def test_explicit_captcha_rejection_gets_one_fresh_challenge(self):
         solve,callbacks=self.captcha_submission_fixture([
-            {'code':400,'message':'验证码非法校验'},
+            {'code':250,'message':'验证码非法校验'},
             {'code':200,'data':{'tradeNo':'second-challenge-order'}},
         ])
         choice=available_choice(self.client.inspect(),self.config)
@@ -242,8 +266,8 @@ class BrowserTests(unittest.TestCase):
 
     def test_captcha_rejection_never_retries_more_than_once(self):
         solve,callbacks=self.captcha_submission_fixture([
-            {'code':400,'message':'验证码非法校验'},
-            {'code':400,'message':'验证码非法校验'},
+            {'code':250,'message':'验证码非法校验'},
+            {'code':250,'message':'验证码非法校验'},
         ])
         choice=available_choice(self.client.inspect(),self.config)
         with patch('cgyy.datetime') as clock:

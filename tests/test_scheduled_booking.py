@@ -83,6 +83,20 @@ class ScheduledBookingTests(unittest.TestCase):
         self.assertEqual(keep.call_count,2)
         self.assertEqual(wait.call_args.args[0],self.job.release)
 
+    def test_immediate_job_returns_after_one_scan_without_polling(self):
+        self.job.poll_availability=False
+        self.job.read_successes=2
+        context=MagicMock()
+        with patch.object(self.job,'login',return_value=(context,self.client)), \
+                patch.object(self.job,'scan',side_effect=[False,AssertionError('unexpected second scan')]) as scan, \
+                patch('scheduled_booking.sleep_until') as wait,patch('scheduled_booking.datetime') as clock:
+            clock.now.return_value=datetime(2026,10,19,7,1,tzinfo=CHINA)
+            self.assertEqual(self.job.run(MagicMock(),'test-user','test-password'),3)
+        scan.assert_called_once()
+        wait.assert_called_once_with(self.job.start,self.job.check_cancelled)
+        self.assertEqual(json.loads(self.job.state_path.read_text())['status'],'no_availability')
+        self.client.submit.assert_not_called()
+
     def test_keeps_session_alive_and_reauthenticates_only_after_expiry(self):
         now=[datetime(2026,10,19,6,5,tzinfo=CHINA)]
         until=datetime(2026,10,19,6,16,tzinfo=CHINA)

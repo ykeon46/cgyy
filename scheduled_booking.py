@@ -43,7 +43,7 @@ def daily_config(config: dict, now: datetime | None = None) -> dict:
 
 
 class BookingJob:
-    def __init__(self, config: dict, state_path: Path, *, payment_qr=False, fast=False, captcha_solver=None, login_state=None):
+    def __init__(self, config: dict, state_path: Path, *, payment_qr=False, fast=False, captcha_solver=None, login_state=None, poll_availability=True):
         self.config = config
         self.state_path = state_path
         self.desired = target_date(config)
@@ -53,6 +53,7 @@ class BookingJob:
         self.submission_started = False
         self.order = None
         self.payment_qr = payment_qr
+        self.poll_availability = poll_availability
         self.read_successes = 0
         self.read_failures = 0
         self.fast = fast
@@ -80,25 +81,29 @@ class BookingJob:
 
     def scan(self, client: VenueClient) -> bool:
         started = time.monotonic()
+        deadline = started + (10 if self.fast else 20)
+        period = f"{self.config['reserve_time'][0]:02}:00–{self.config['reserve_time'][-1]+1:02}:00"
         for venue in self.config['venues']:
             self.check_cancelled()
             if self.submission_started:
                 raise ReservationError('已经尝试过提交，停止以免重复下单。')
             client.config = dict(self.config, venue=venue)
-            self.status('checking', venue=venue)
+            self.status('checking', venue=venue, phase='open_venue', message=f'正在加载{venue}。')
             slots = None
             for attempt in range(2):
                 phase = 'open_venue'
                 try:
-                    if self.fast and self.prepared_venue == venue:
-                        self.prepared_venue = None
-                        client.refresh_availability()
-                    else:
-                        client.open_venue()
-                    phase = 'choose_date'
-                    client.choose_date(self.desired)
-                    phase = 'inspect'
-                    slots = client.find_choice() if self.fast else client.inspect()
+                    with client.reading_until(deadline):
+                        if self.fast and self.prepared_venue == venue:
+                            self.prepared_venue = None
+                            client.refresh_availability()
+                        else:
+                            client.open_venue()
+                        phase = 'choose_date'
+                        self.status('checking', phase=phase, message=f'正在读取{self.desired}的{period}余票。')
+                        client.choose_date(self.desired)
+                        phase = 'inspect'
+                        slots = client.find_choice() if self.fast else client.inspect()
                     break
                 except ReservationError as error:
                     LOG.info('%s：%s', venue, error)
@@ -112,6 +117,9 @@ class BookingJob:
                                 venue=venue, phase=phase, error_type=type(error).__name__, page_path=path)
                     LOG.warning('%s：读取 %s 失败（%s），%s。', venue, phase,
                                 type(error).__name__, '重试一次' if attempt == 0 else '继续检查其他场馆')
+                    LOG.info('读取失败详情：%s', str(error).splitlines()[0])
+                    if time.monotonic() >= deadline:
+                        break
             if slots is None:
                 continue
             self.read_successes += 1
@@ -124,7 +132,7 @@ class BookingJob:
                 stream.write(json.dumps(audit,ensure_ascii=False) + '\n')
             chosen = available_choice(slots, client.config)
             if not chosen:
-                LOG.info('%s 无满足 20:00–22:00 的连续场地。', venue)
+                LOG.info('%s 无满足 %s 的连续场地。', venue, period)
                 continue
             if self.fast and time.monotonic() - started >= 10:
                 raise ReservationError('本轮查场已超过10秒预算，未提交订单。')
@@ -162,7 +170,7 @@ class BookingJob:
                 payer = CampusQRCode(client.page,replace(expected,trade_no=data['tradeNo']))
                 try:
                     qr = payer.create()
-                    self.status('awaiting_payment', **qr, message='请用微信或支付宝扫描官方二维码，在倒计时内完成付款。')
+                    self.status('awaiting_payment', **qr, message=qr.get('scan_tip','请在倒计时内扫描官方二维码付款。'))
                     payer.wait_for_payment(qr['expires_at'], self.status)
                 except (PaymentError,BrowserError) as error:
                     self.status('qr_needs_attention',message=str(error) if isinstance(error,PaymentError) else '订单已生成，二维码或支付状态读取失败，请到场馆网站核对，不重复下单。',qr_code=None)
@@ -230,11 +238,13 @@ class BookingJob:
             while datetime.now(CHINA) < self.stop:
                 if self.scan(client):
                     return 0
-                self.status('waiting_availability')
+                if not self.poll_availability:
+                    break
+                self.status('waiting_availability', message='本轮未找到空场，30秒后再次查询。')
                 sleep_until(min(datetime.now(CHINA) + timedelta(seconds=30), self.stop),self.check_cancelled)
             if self.read_successes:
                 self.status('no_availability', successful_queries=self.read_successes, read_errors=self.read_failures,
-                            message='已完成的查询未找到连续两小时的可预约场地，逐场地明细见 queries.jsonl。')
+                            message='本次查询未找到所选时段的连续可预约场地，未下单。' + ('部分场馆读取失败，可稍后重新查询。' if self.read_failures else ''))
                 return 3
             self.status('failed', successful_queries=0, read_errors=self.read_failures,
                         message='没有完成有效查询，不能据此判断场地是否已满。')

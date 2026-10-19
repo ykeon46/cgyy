@@ -90,7 +90,8 @@ def run():
         start=max(now,release-timedelta(minutes=2))
         config.update(start_at=start.isoformat(),release_at=release.isoformat(),stop_at=(release+timedelta(minutes=5)).isoformat())
     job=BookingJob(config,directory/'status.json',fast=config.get('fast',True),payment_qr=True,
-                   login_state=LoginState() if config.get('remember_session',True) else LoginState(None))
+                   login_state=LoginState() if config.get('remember_session',True) else LoginState(None),
+                   poll_availability=request.get('mode')!='now')
     lock=(ROOT/'artifacts/booking-execution.lock').open('w')
     try:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)

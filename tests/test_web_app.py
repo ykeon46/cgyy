@@ -130,5 +130,16 @@ class BrowserUITests(unittest.TestCase):
         self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth<=window.innerWidth'))
         self.assertEqual(self.errors,[])
 
+    def test_native_payment_qr_is_distinguished_from_cashier_entry(self):
+        self.jobs=[{'id':'native-qr-test','status':'awaiting_payment','trade_no':'test-trade',
+                    'qr_kind':'alipay_payment','scan_tip':'请使用已登录的手机支付宝扫码，在手机上确认付款。',
+                    'expires_at':(datetime.now(web_app.CHINA)+timedelta(seconds=50)).isoformat(),
+                    'qr_code':'data:image/png;base64,aGVsbG8=','updated_at':datetime.now(web_app.CHINA).isoformat()}]
+        self.login()
+        self.page.wait_for_function("()=>document.querySelector('#payment-title').textContent==='支付宝付款码'")
+        self.assertEqual(self.page.locator('#payment-title').inner_text(),'支付宝付款码')
+        self.assertIn('手机支付宝',self.page.locator('#payment-subtitle').inner_text())
+        self.assertEqual(self.page.locator('#payment-qr').get_attribute('alt'),'支付宝交易付款二维码')
+
 
 if __name__=='__main__':unittest.main()

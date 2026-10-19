@@ -1,3 +1,4 @@
 playwright>=1.49,<2
 PyYAML>=6.0.2,<7
+qrcode[pil]>=8,<9
 tzdata>=2024.1; sys_platform == 'win32'

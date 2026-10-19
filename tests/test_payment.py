@@ -5,6 +5,8 @@ from decimal import Decimal
 import base64
 import os
 import unittest
+import cv2
+import numpy as np
 from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 from payment import CampusQRCode, ExpectedOrder, PaymentError, amount
@@ -34,7 +36,7 @@ class QRTests(unittest.TestCase):
     def tearDownClass(cls):cls.browser.close();cls.playwright.stop()
     def setUp(self):
         self.context=self.browser.new_context();self.context.route('**/*',self.route)
-        self.order=deepcopy(ORDER);self.requests=[]
+        self.order=deepcopy(ORDER);self.requests=[];self.native_html=None
         self.result={'payFee':15,'schoolPayUrl':'https://cashier.cc-pay.cn/cashier?test=1','payCode':PNG}
         self.page=self.context.new_page();self.page.goto('https://cgyy.buaa.edu.cn/venue/venue-reservation/38')
         self.expected=ExpectedOrder.from_choice('test-trade',VENUE,date(2026,10,21),CHOICE,Decimal('15'))
@@ -43,16 +45,43 @@ class QRTests(unittest.TestCase):
         req=route.request;self.requests.append((req.method,req.url));path=urlparse(req.url).path
         if path.endswith('/api/venue/finances/order/detail'):route.fulfill(json={'code':200,'data':self.order})
         elif path.endswith('/api/venue/finances/order/pay'):route.fulfill(json={'code':200,'data':self.result})
+        elif urlparse(req.url).hostname=='cashier.cc-pay.cn':route.fulfill(content_type='text/html',body='''
+            <svg width="40" height="40" onclick="location.href='https://excashier.alipay.com/standard/fastpayQr.htm'">
+            <use href="#iconzhifubaozhifu1"></use><rect width="40" height="40"></rect></svg>''')
+        elif urlparse(req.url).hostname=='excashier.alipay.com':route.fulfill(content_type='text/html; charset=utf-8',body=self.native_html or '')
         else:route.fulfill(content_type='text/html; charset=utf-8',body=('<meta charset="utf-8">'+VENUE_HTML))
-    def test_returns_official_png_without_visiting_payment_account_pages(self):
-        payer=CampusQRCode(self.page,self.expected);result=payer.create()
+    def test_returns_campus_entry_png_when_requested(self):
+        payer=CampusQRCode(self.page,self.expected,direct=False);result=payer.create()
         self.assertEqual(result['qr_code'],'data:image/png;base64,'+PNG)
         self.assertEqual(result['amount'],'15.00')
         self.assertIn('expires_at',result)
         self.assertTrue(all(urlparse(url).hostname=='cgyy.buaa.edu.cn' for _,url in self.requests))
         self.assertEqual(sum(method=='POST' for method,_ in self.requests),1)
+        self.assertEqual(result['qr_kind'],'campus_cashier')
         with self.assertRaises(PaymentError):payer.create()
         self.assertEqual(sum(method=='POST' for method,_ in self.requests),1)
+    def prepare_alipay_page(self):
+        target='https://qr.alipay.com/test-transaction'
+        self.native_html=f'''<meta charset="utf-8"><div>北京航空航天大学</div>
+            <strong class="order-amount">¥ 15.00</strong>
+            <input id="J_qrCode" type="hidden" value="{target}">'''
+        return target
+    def test_returns_native_alipay_transaction_qr_without_account_login(self):
+        target=self.prepare_alipay_page()
+        result=CampusQRCode(self.page,self.expected).create()
+        self.assertEqual(result['qr_kind'],'alipay_payment')
+        png=base64.b64decode(result['qr_code'].split(',',1)[1])
+        decoded,_,_=cv2.QRCodeDetector().detectAndDecode(cv2.imdecode(np.frombuffer(png,dtype=np.uint8),cv2.IMREAD_COLOR))
+        self.assertEqual(decoded,target)
+        self.assertEqual(sum(method=='POST' for method,_ in self.requests),1)
+        self.assertFalse(any('securityPost' in url or 'login' in url.lower() for _,url in self.requests))
+    def test_native_qr_wrong_amount_or_target_falls_back_to_labelled_entry(self):
+        for old,new in [('¥ 15.00','¥ 16.00'),('https://qr.alipay.com/','https://example.test/')]:
+            with self.subTest(change=new):
+                self.prepare_alipay_page();self.native_html=self.native_html.replace(old,new)
+                result=CampusQRCode(self.page,self.expected).create()
+                self.assertEqual(result['qr_kind'],'campus_cashier')
+                self.assertIn('可能需要登录',result['scan_tip'])
     def test_changed_order_or_expiry_never_requests_payment(self):
         for change in [{'payFee':16},{'subject':'其他场馆'},{'orderStatus':2},{'payStatus':2},{'remainSecond':1}]:
             with self.subTest(change=change):
