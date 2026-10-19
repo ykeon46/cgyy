@@ -10,9 +10,9 @@ import sys
 if sys.platform != 'linux':
     raise unittest.SkipTest('Linux systemd 后台预约任务')
 
-from cgyy import CHINA, DEFAULT_CONFIG, ReservationError, load_config
+from cgyy import CHINA, DEFAULT_CONFIG, ReservationError, TaskStopped, load_config
 from scheduled_booking import BookingJob, daily_config, main
-from payment import PaymentError, PaymentSettings
+from payment import PaymentError
 from decimal import Decimal
 
 
@@ -81,7 +81,7 @@ class ScheduledBookingTests(unittest.TestCase):
         scan.assert_called_once_with(self.client)
         self.client.prepare_booking.assert_called_once_with(self.job.desired)
         self.assertEqual(keep.call_count,2)
-        self.assertEqual(wait.call_args.args,(self.job.release,))
+        self.assertEqual(wait.call_args.args[0],self.job.release)
 
     def test_keeps_session_alive_and_reauthenticates_only_after_expiry(self):
         now=[datetime(2026,10,19,6,5,tzinfo=CHINA)]
@@ -92,7 +92,7 @@ class ScheduledBookingTests(unittest.TestCase):
         self.job.login_state=MagicMock()
         self.job.prepared_venue=self.config['venues'][0]
         with patch('scheduled_booking.datetime') as clock, \
-                patch('scheduled_booking.sleep_until',side_effect=lambda target:now.__setitem__(0,target)), \
+                patch('scheduled_booking.sleep_until',side_effect=lambda target,*args:now.__setitem__(0,target)), \
                 patch.object(self.job,'login',return_value=(new_context,new_client)) as login:
             clock.now.side_effect=lambda zone:now[0]
             result=self.job.keep_session_until(MagicMock(),first_context,self.client,'user','password',until)
@@ -119,12 +119,18 @@ class ScheduledBookingTests(unittest.TestCase):
         self.assertEqual(planned['start_at'],'2026-10-20T06:05:00+08:00')
         self.assertEqual(planned['reserve_date'],'2026-10-22')
 
-    def test_daily_schedule_rejects_login_or_release_outside_requested_window(self):
-        for change in [{'login_at':'05:59:00'},{'release_at':'06:59:00'},{'keep_alive_seconds':0}]:
+    def test_daily_schedule_rejects_invalid_time_order_or_interval(self):
+        for change in [{'login_at':'07:01:00'},{'release_at':'06:00:00'},{'keep_alive_seconds':0}]:
             config=load_config(DEFAULT_CONFIG)
             config['daily_schedule'].update(change)
             with self.subTest(change=change), self.assertRaises(ReservationError):
                 daily_config(config,datetime(2026,10,20,tzinfo=CHINA))
+
+    def test_stop_request_is_checked_before_any_submission(self):
+        (self.root/'cancel.request').write_text('stop')
+        with self.assertRaises(TaskStopped):self.job.scan(self.client)
+        self.client.submit.assert_not_called()
+        self.assertEqual(json.loads(self.job.state_path.read_text())['status'],'stopped')
 
     def test_uncertain_submission_stops_before_trying_other_venue(self):
         self.client.submit.side_effect = ReservationError('未收到订单响应')
@@ -171,19 +177,17 @@ class ScheduledBookingTests(unittest.TestCase):
         self.assertEqual(json.loads(self.job.state_path.read_text())['status'], 'locked')
         self.assertTrue(secret.exists())
 
-    def test_auto_payment_failure_preserves_order_and_stops_other_venues(self):
-        self.job.auto_pay=True
-        self.job.payment_settings=PaymentSettings(Decimal('100'),'fake-account','fake-secret')
-        choice=[dict(s,text='￥25.00') for s in self.choice]
+    def test_qr_failure_preserves_order_and_stops_other_venues(self):
+        self.job.payment_qr=True
+        self.job.config['max_pay_amount']='100.00'
+        choice=[dict(slot,text='￥25.00') for slot in self.choice]
         self.client.submit.return_value={'tradeNo':'test-trade'}
-        with patch('scheduled_booking.available_choice',return_value=choice), patch('scheduled_booking.AlipayPayment') as factory:
-            factory.return_value.submitted=True
-            factory.return_value.run.side_effect=PaymentError('付款结果不明')
-            with self.assertRaises(PaymentError):
-                self.job.scan(self.client)
+        with patch('scheduled_booking.available_choice',return_value=choice), patch('scheduled_booking.CampusQRCode') as factory:
+            factory.return_value.create.side_effect=PaymentError('二维码读取失败')
+            with self.assertRaises(PaymentError):self.job.scan(self.client)
         self.client.submit.assert_called_once()
         self.assertEqual(self.job.order,{'tradeNo':'test-trade'})
-        self.assertEqual(json.loads(self.job.state_path.read_text())['status'],'payment_unknown')
+        self.assertEqual(json.loads(self.job.state_path.read_text())['status'],'qr_needs_attention')
 
 
 if __name__ == '__main__':

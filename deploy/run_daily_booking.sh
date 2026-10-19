@@ -13,8 +13,10 @@ if [[ -f artifacts/runtime/environment.sh ]]; then
   source artifacts/runtime/environment.sh
 fi
 
+config_path="$project_root/configs/default.yaml"
+if [[ -f artifacts/web/config.yaml ]]; then config_path="$project_root/artifacts/web/config.yaml"; fi
 booking_command=("$project_root/.venv/bin/python" "$project_root/scheduled_booking.py"
-  --daily --fast --headed --captcha-repo "$project_root/artifacts/Text_select_captcha" "$@")
+  --config "$config_path" --daily --headed --payment-qr --captcha-repo "$project_root/artifacts/Text_select_captcha" "$@")
 if [[ -n "${DISPLAY:-}" ]]; then
   exec "${booking_command[@]}"
 elif command -v xvfb-run >/dev/null 2>&1; then

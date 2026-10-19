@@ -13,9 +13,9 @@ import time
 from urllib.parse import urlencode, urlparse
 
 from playwright.sync_api import Error as BrowserError, sync_playwright
-from cgyy import BASE_URL, CHINA, DEFAULT_CONFIG, LOG, ReservationError, VenueClient, authenticated_client, available_choice, load_config, sleep_until, target_date
+from cgyy import BASE_URL, CHINA, DEFAULT_CONFIG, LOG, ReservationError, SubmissionRejected, TaskStopped, VenueClient, authenticated_client, available_choice, load_config, sleep_until, target_date
 from login_state import DEFAULT_SESSION_STATE, LoginState
-from payment import AlipayPayment, ExpectedOrder, PaymentError, PaymentSettings, check_previous_result
+from payment import CampusQRCode, ExpectedOrder, PaymentError, amount
 from text_captcha import CaptchaError, TextCaptchaSolver
 
 
@@ -29,8 +29,8 @@ def daily_config(config: dict, now: datetime | None = None) -> dict:
     except (ValueError, TypeError, AttributeError) as error:
         raise ReservationError('daily_schedule 时间应为 HH:MM:SS，登录检查间隔应为正整数。') from error
     if (any(value.tzinfo is not None for value in times) or
-            not wall_time(6) < times[0] < times[1] == wall_time(7) < times[2] or interval < 30):
-        raise ReservationError('每日任务须在6点后、7点前登录，7点开放，之后截止；检查间隔至少30秒。')
+            not times[0] < times[1] < times[2] or interval < 30):
+        raise ReservationError('登录、开始预约、截止时间须依次递增；检查间隔至少30秒。')
     day = now.date()
     if now >= datetime.combine(day,times[2],CHINA):
         day += timedelta(days=1)
@@ -43,7 +43,7 @@ def daily_config(config: dict, now: datetime | None = None) -> dict:
 
 
 class BookingJob:
-    def __init__(self, config: dict, state_path: Path, *, payment_settings=None, auto_pay=False, payment_preview=False, fast=False, captcha_solver=None, login_state=None):
+    def __init__(self, config: dict, state_path: Path, *, payment_qr=False, fast=False, captcha_solver=None, login_state=None):
         self.config = config
         self.state_path = state_path
         self.desired = target_date(config)
@@ -52,9 +52,7 @@ class BookingJob:
         self.stop = datetime.fromisoformat(config['stop_at']).astimezone(CHINA)
         self.submission_started = False
         self.order = None
-        self.payment_settings = payment_settings
-        self.auto_pay = auto_pay
-        self.payment_preview = payment_preview
+        self.payment_qr = payment_qr
         self.read_successes = 0
         self.read_failures = 0
         self.fast = fast
@@ -83,6 +81,7 @@ class BookingJob:
     def scan(self, client: VenueClient) -> bool:
         started = time.monotonic()
         for venue in self.config['venues']:
+            self.check_cancelled()
             if self.submission_started:
                 raise ReservationError('已经尝试过提交，停止以免重复下单。')
             client.config = dict(self.config, venue=venue)
@@ -130,8 +129,9 @@ class BookingJob:
             if self.fast and time.monotonic() - started >= 10:
                 raise ReservationError('本轮查场已超过10秒预算，未提交订单。')
             expected = None
-            if self.auto_pay or self.payment_preview:
-                expected = ExpectedOrder.from_choice('', venue, self.desired, chosen, self.payment_settings.limit)
+            if self.payment_qr:
+                expected = ExpectedOrder.from_choice('',venue,self.desired,chosen,amount(self.config.get('max_pay_amount','70.00')))
+            self.check_cancelled()
             self.submission_started = True
             self.status('submitting', venue=venue, court=chosen[0]['court'])
             try:
@@ -140,6 +140,9 @@ class BookingJob:
                     data = client.submit(chosen, timeout=timeout, captcha_solver=self.captcha_solver)
                 else:
                     data = client.submit(chosen)
+            except SubmissionRejected as error:
+                self.status('rejected',message=str(error))
+                raise
             except (ReservationError, BrowserError, CaptchaError):
                 # 提交超时也可能已经生成订单，绝不能换场馆再下单。
                 self.status('needs_attention', message='提交未确认成功；请先登录个人中心核对订单，不自动重试。')
@@ -151,20 +154,19 @@ class BookingJob:
             self.order = data
             payment_url = BASE_URL + '/venue/pay-order?' + urlencode({'tradeNo': data['tradeNo']})
             self.status('locked', venue=venue, court=chosen[0]['court'], trade_no=data['tradeNo'],
+                        date=str(self.desired), slots=[(cell['court'],cell['start'],cell['end']) for cell in chosen],
                         payment_url=payment_url, booking_elapsed_seconds=round(time.monotonic() - started, 3),
                         message='订单已生成，请本人尽快登录网站，在页面倒计时内付款。')
             if expected is not None:
                 from dataclasses import replace
-                expected = replace(expected, trade_no=data['tradeNo'])
-                payer = AlipayPayment(client.page, expected, self.payment_settings,
-                                      self.state_path.parent/'payment-result.json', charge=self.auto_pay)
+                payer = CampusQRCode(client.page,replace(expected,trade_no=data['tradeNo']))
                 try:
-                    result = payer.run()
-                except PaymentError:
-                    self.status('payment_unknown' if payer.submitted else 'payment_needs_attention',
-                                message='付款流程停止，请先核对支付宝及场馆订单，不重新下单。')
+                    qr = payer.create()
+                    self.status('awaiting_payment', **qr, message='请用微信或支付宝扫描官方二维码，在倒计时内完成付款。')
+                    payer.wait_for_payment(qr['expires_at'], self.status)
+                except (PaymentError,BrowserError) as error:
+                    self.status('qr_needs_attention',message=str(error) if isinstance(error,PaymentError) else '订单已生成，二维码或支付状态读取失败，请到场馆网站核对，不重复下单。',qr_code=None)
                     raise
-                self.status(result, message='已核对场馆订单支付成功。' if result == 'paid' else '已打开支付宝付款页，未提交付款。')
                 return True
             try:
                 client.page.wait_for_timeout(1000)
@@ -179,11 +181,16 @@ class BookingJob:
         return authenticated_client(browser, self.config, user, lambda:password, self.login_state,
                                     ignore_password_warning=True)
 
+    def check_cancelled(self):
+        if (self.state_path.parent/'cancel.request').exists():
+            self.status('stopped',message='预约任务已停止。')
+            raise TaskStopped('预约任务已停止。')
+
     def keep_session_until(self, browser, context, client, user: str, password: str, until: datetime):
         while datetime.now(CHINA) < until:
             check_at = min(datetime.now(CHINA) + timedelta(seconds=self.keep_alive_seconds), until)
             self.status('keeping_session', next_check_at=check_at.isoformat(), release_at=self.release.isoformat())
-            sleep_until(check_at)
+            sleep_until(check_at,self.check_cancelled)
             if client.check_session(user):
                 self.login_state.save(context, user)
                 self.status('session_valid', checked_at=datetime.now(CHINA).isoformat())
@@ -195,14 +202,12 @@ class BookingJob:
 
     def run(self, browser, user: str, password: str) -> int:
         self.status('waiting_start')
-        sleep_until(self.start)
+        sleep_until(self.start,self.check_cancelled)
         if datetime.now(CHINA) >= self.stop:
             self.status('expired', message='已过本次任务截止时间，未尝试下单。')
             return 3
         context, client = self.login(browser, user, password)
         try:
-            if not self.fast and self.scan(client):
-                return 0
             if datetime.now(CHINA) < self.release:
                 self.status('waiting_release', release_at=self.release.isoformat())
                 context, client = self.keep_session_until(browser, context, client, user, password,
@@ -221,12 +226,12 @@ class BookingJob:
                     client.config = dict(self.config, venue=self.config['venues'][0])
                     client.prepare_booking(self.desired)
                     self.prepared_venue = self.config['venues'][0]
-                sleep_until(self.release)
+                sleep_until(self.release,self.check_cancelled)
             while datetime.now(CHINA) < self.stop:
                 if self.scan(client):
                     return 0
                 self.status('waiting_availability')
-                sleep_until(min(datetime.now(CHINA) + timedelta(seconds=30), self.stop))
+                sleep_until(min(datetime.now(CHINA) + timedelta(seconds=30), self.stop),self.check_cancelled)
             if self.read_successes:
                 self.status('no_availability', successful_queries=self.read_successes, read_errors=self.read_failures,
                             message='已完成的查询未找到连续两小时的可预约场地，逐场地明细见 queries.jsonl。')
@@ -252,10 +257,8 @@ def main(argv=None):
     parser.add_argument('--no-session-cache', action='store_true', help='禁用登录态缓存')
     parser.add_argument('--captcha-repo', type=Path, help='Text_select_captcha 本地仓库')
     parser.add_argument('--captcha-font', type=Path, default=Path('/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf'))
-    pay_mode = parser.add_mutually_exclusive_group()
-    pay_mode.add_argument('--auto-pay', action='store_true', help='下单后提交支付宝付款，可能实际扣款')
-    pay_mode.add_argument('--payment-preview', action='store_true', help='打开支付宝付款页，不提交付款')
-    parser.add_argument('--max-pay-amount', help='人民币单笔上限，默认读取 CGYY_MAX_PAY_AMOUNT')
+    parser.add_argument('--payment-qr', action='store_true', help='下单后返回官方校园付二维码')
+    parser.add_argument('--max-pay-amount')
     args = parser.parse_args(argv)
     os.umask(0o077)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s', datefmt='%H:%M:%S')
@@ -266,17 +269,16 @@ def main(argv=None):
         daily = args.daily or not any(config.get(key) for key in ['start_at','release_at','stop_at'])
         if daily:
             config = daily_config(config)
-            args.fast = True
+            args.fast = args.fast or config.get('fast',True)
         if args.browser_binary:
             config['browser_binary'] = args.browser_binary
         if args.state is None:
             if not daily:
                 raise ReservationError('一次性任务请指定 --state。')
             args.state = Path('artifacts/daily') / datetime.fromisoformat(config['start_at']).date().isoformat() / 'status.json'
-        enabled = args.auto_pay or args.payment_preview
-        settings = PaymentSettings.from_env(args.max_pay_amount, charge=args.auto_pay) if enabled else None
-        job = BookingJob(config, args.state, payment_settings=settings, auto_pay=args.auto_pay, payment_preview=args.payment_preview, fast=args.fast,
-                         login_state=LoginState(None if args.no_session_cache else args.session_state))
+        config['max_pay_amount'] = args.max_pay_amount or config.get('max_pay_amount') or os.getenv('CGYY_MAX_PAY_AMOUNT','70.00')
+        job = BookingJob(config,args.state,payment_qr=args.payment_qr,fast=args.fast,
+                         login_state=LoginState(None if args.no_session_cache or not config.get('remember_session',True) else args.session_state))
         if args.validate:
             if config.get('browser_binary') and not Path(config['browser_binary']).is_file():
                 raise ReservationError('指定浏览器不存在。')
@@ -286,18 +288,16 @@ def main(argv=None):
                               'state_path':str(args.state)}, ensure_ascii=False))
             return 0
         args.state.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        lock_file = (args.state.parent / 'execution.lock').open('w')
+        lock_file = Path('artifacts/booking-execution.lock').open('w')
         try:
             fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             LOG.error('已有同一预约任务正在执行，拒绝重复启动。')
             return 1
         if args.state.exists() and json.loads(args.state.read_text()).get('status') in {
-                'locked','submitting','needs_attention','paid','payment_unknown','payment_needs_attention','payment_preview_ready'}:
+                'locked','submitting','needs_attention','paid','awaiting_payment','qr_needs_attention'}:
             LOG.error('此前已提交或提交状态不明；先核对已有订单，拒绝重复执行。')
             return 1
-        if enabled:
-            check_previous_result(args.state.parent/'payment-result.json')
         if args.captcha_repo:
             job.captcha_solver = TextCaptchaSolver(args.captcha_repo, args.captcha_font)
         secret = {}
@@ -323,7 +323,7 @@ def main(argv=None):
                 password = ''
     except (ReservationError, PaymentError, BrowserError, OSError, ValueError, KeyError) as error:
         if not args.validate and job is not None and not job.order and not job.submission_started:
-            job.status('failed', message='预约程序未完成，请查看运行日志或登录网站检查。')
+            job.status('stopped' if isinstance(error,TaskStopped) else 'failed', message='任务已停止。' if isinstance(error,TaskStopped) else '预约程序未完成，请查看运行日志或登录网站检查。')
         if isinstance(error, (ReservationError, PaymentError)):
             LOG.error('%s', error)
         else:

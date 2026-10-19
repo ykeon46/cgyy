@@ -19,3 +19,6 @@ daily_schedule:
   keep_alive_seconds: 300 # 开放前每5分钟检查登录态，失效才重新登录
 candidates: [1] # 同伴列表序号（从 1 起）；不需要同伴可填 []
 phone: '' # 页面要求填写且未自动带出时使用
+max_pay_amount: '70.00' # 预约金额上限，由本人扫码付款
+fast: true
+remember_session: true

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>北航 · 场馆预约</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+<section id="login-screen" class="login-screen">
+  <div class="login-story"><a class="brand" href="/"><span class="brand-icon">羽</span><span>COURTSIDE <small>北航场馆预约</small></span></a>
+    <div class="story-title"><span class="eyebrow">MAKE TIME TO PLAY</span><h1>把时间留给<br>下一场好球。</h1><p>选好场次，准备上场。<br>从预约到扫码，一处完成。</p></div>
+    <div class="court-art" aria-hidden="true"><div class="court-line outer"></div><div class="court-line inner"></div><div class="court-line mid"></div><div class="court-net"></div><span class="shuttle">✧</span><span class="court-caption">XUEYUAN ROAD · BADMINTON</span></div>
+    <span class="story-foot">学院路校区 · 主馆 / 副馆</span>
+  </div>
+  <div class="login-form-wrap"><form id="login-form" class="login-form"><span class="eyebrow">WELCOME BACK</span><h2>登录预约控制台</h2><p class="muted">使用北航统一身份认证账号登录</p>
+    <label for="username">学号 / 工号</label><input id="username" name="username" autocomplete="username" placeholder="请输入学校账号" required maxlength="100">
+    <label for="password">统一认证密码</label><div class="password-wrap"><input id="password" name="password" type="password" autocomplete="current-password" placeholder="请输入学校密码" required maxlength="500"><button id="show-password" type="button" aria-label="显示密码">显示</button></div>
+    <p id="login-error" class="error" role="alert"></p><button id="login-button" type="submit" class="primary full">登录并继续 <span>↗</span></button>
+    <p class="login-note">学校账号用于登录及每日任务。付款时只需扫码，<br>无需填写支付宝账号或支付密码。</p>
+  </form></div>
+</section>
+<div id="dashboard" class="app hidden">
+  <aside class="sidebar"><a class="brand" href="/"><span class="brand-icon">羽</span><span>COURTSIDE <small>北航场馆预约</small></span></a><div class="sidebar-label">工作台</div>
+    <button class="nav active" id="nav-booking"><span>▦</span>预约控制台</button><button class="nav" id="nav-history"><span>◷</span>预约记录 <span id="history-count" class="count">0</span></button>
+    <div class="sidebar-bottom"><div class="site-note"><span class="status-dot"></span> 学院路校区 <small>北京时间 · UTC+8</small></div><button id="logout" class="account"><span class="avatar">B</span><span><b id="account-name">已登录</b><small>切换学校账号</small></span><span>↗</span></button></div>
+  </aside>
+  <main><header class="topbar"><span>工作台 <span class="slash">/</span> <b id="page-label">预约控制台</b></span><span class="connection"><i class="status-dot"></i>学校账号已连接</span></header>
+  <div class="page-content"><div class="page-heading"><div><span class="eyebrow">YOUR NEXT SESSION</span><h1>预约下一场<span class="title-dot">。</span></h1><p class="muted">配置你的场次，下单后直接扫码付款。</p></div><span id="today" class="date-stamp"></span></div>
+  <section id="booking-view" class="workspace">
+    <form id="booking-form" class="configuration"><div class="card"><div class="card-heading"><span class="step-number">01</span><h2>预约场次</h2><span class="tag">羽毛球</span></div>
+      <div class="field"><label>选择场馆 <span class="label-note">至少选择一个，按顺序尝试</span></label><div class="venue-grid"><label class="venue-option"><input type="checkbox" name="venue" value="main" checked><span class="venue-symbol">▤</span><span><b>体育馆主馆</b><small>学院路 · 1–12号场地</small></span><i></i></label><label class="venue-option"><input type="checkbox" name="venue" value="training" checked><span class="venue-symbol">▥</span><span><b>训练馆 / 副馆</b><small>学院路 · 17–24号场地</small></span><i></i></label></div></div>
+      <div class="field"><label for="reserve-date">预约日期</label><div class="date-inputs"><input id="reserve-date" type="date" required><label class="inline-label">每日提前 <select id="days-ahead"><option value="0">当天</option><option value="1">1天</option><option value="2" selected>2天</option><option value="3">3天</option></select></label></div><small class="hint">立即预约使用所选日期；每日任务按提前天数滚动。</small></div>
+      <div class="field"><label>预约时段 <span class="label-note">选择连续整小时</span></label><div class="time-range"><select id="start-hour" aria-label="开始时间"></select><span class="range-line">—</span><select id="end-hour" aria-label="结束时间"></select><span id="duration" class="duration">2小时</span></div></div>
+      <div class="field"><div class="label-row"><label>场地偏好</label><button type="button" id="any-court" class="text-button">任意场地</button></div><div class="court-chips" id="court-chips"></div><small class="hint">不选则任意场地；选中后优先尝试，暂无空位时可选择其他场地。</small></div>
+    </div>
+    <div class="card"><div class="card-heading"><span class="step-number">02</span><h2>预约安排</h2></div><div class="segmented" id="mode-picker"><button type="button" data-mode="now" class="selected">立即预约</button><button type="button" data-mode="once">定时预约</button><button type="button" data-mode="daily">每日自动</button></div>
+      <div id="once-fields" class="field hidden"><label for="run-at">开始预约的时间（北京时间）</label><input id="run-at" type="datetime-local"></div>
+      <div id="daily-fields" class="daily-fields hidden"><div class="three-fields"><div><label for="login-at">提前登录</label><input id="login-at" type="time" value="06:05" required></div><div><label for="release-at">开始预约</label><input id="release-at" type="time" value="07:00" required></div><div><label for="stop-at">最晚截止</label><input id="stop-at" type="time" value="08:00" required></div></div><div class="schedule-note"><span>◷</span><span>开放前保持登录，找到连续场地后只提交一笔订单。</span></div><label class="toggle-row"><span>启用每日自动预约</span><input id="daily-enabled" type="checkbox" role="switch"><i></i></label></div>
+      <details class="advanced"><summary>更多配置 <span>同伴、金额上限与登录</span></summary><div class="two-fields"><div><label for="companions">选择同伴</label><select id="companions" multiple size="3" aria-label="选择预约同伴"></select><small id="buddy-hint" class="hint"></small></div><div><label for="phone">联系电话</label><input id="phone" type="tel" placeholder="场馆未自动带出时使用" maxlength="11"></div><div><label for="max-amount">单笔金额上限（元）</label><input id="max-amount" type="number" min="0.01" max="1000" step="0.01" value="70"></div><div><label for="keep-alive">登录核验间隔</label><select id="keep-alive"><option value="60">每1分钟</option><option value="180">每3分钟</option><option value="300" selected>每5分钟</option><option value="600">每10分钟</option></select></div></div><label class="check-row"><input id="fast-mode" type="checkbox" checked>启用10秒下单预算</label><label class="check-row"><input id="remember-session" type="checkbox" checked>复用学校登录态，失效后重新登录</label></details>
+    </div><div class="action-bar"><button id="save-config" type="button" class="secondary">保存设置</button><button id="submit-booking" type="submit" class="primary">预约并获取付款码 <span>↗</span></button></div><p id="form-error" class="error" role="alert"></p></form>
+    <aside class="payment-column"><section class="card payment-card"><div class="payment-heading"><span class="eyebrow">PAYMENT</span><span id="payment-badge" class="badge">等待预约</span></div><h2 id="payment-title">付款二维码</h2><p id="payment-subtitle" class="muted">预约成功后，官方付款码会显示在这里</p><div id="qr-frame" class="qr-frame"><div id="qr-placeholder" class="qr-placeholder"><span class="scan-icon"></span><b>先选场，再扫码</b><small>微信 / 支付宝 / 云闪付</small></div><img id="payment-qr" class="hidden" alt="校园付官方付款二维码"></div><div id="countdown-wrap" class="countdown-wrap hidden"><span>请在倒计时内完成付款</span><strong id="countdown">00:00</strong><div class="progress-track"><div id="countdown-progress"></div></div></div><div id="order-details" class="order-details hidden"></div><div id="payment-actions" class="payment-actions hidden"><a id="cashier-link" class="secondary" target="_blank" rel="noopener noreferrer">打开官方收银台 ↗</a><a id="download-qr" class="text-button" download="校园付付款码.png">保存二维码</a></div><button id="recheck-order" type="button" class="text-button hidden">核对订单状态</button><div class="payment-footnote">付款后自动核对场馆状态<br>以“已支付、预约有效”为完成标准</div></section>
+      <section class="card task-card"><div class="label-row"><h2>任务进度</h2><button id="cancel-job" type="button" class="text-button hidden">停止任务</button></div><ol class="steps"><li id="step-login" class="done"><i>✓</i><span>学校账号已登录</span></li><li id="step-book"><i>2</i><span>等待预约场次</span></li><li id="step-pay"><i>3</i><span>获取付款二维码</span></li><li id="step-done"><i>4</i><span>核对预约结果</span></li></ol><p id="task-message" class="hint">所有时间均为北京时间。</p></section>
+    </aside>
+  </section>
+  <section id="history-view" class="card hidden"><div class="card-heading"><h2>预约记录</h2><span class="muted">本机任务与每日预约</span></div><div id="history-list"></div></section>
+  <footer class="page-footer"><span>COURTSIDE · BUAA</span><span>留点时间，去打球。</span></footer>
+  </div></main>
+</div><div id="toast" class="toast hidden" role="status"></div><script src="/app.js"></script>
+</body></html>

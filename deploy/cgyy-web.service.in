@@ -1,0 +1,12 @@
+[Unit]
+Description=BUAA booking web console
+
+[Service]
+Type=exec
+WorkingDirectory=@PROJECT_ROOT@
+ExecStart=@PROJECT_ROOT@/deploy/run_web.sh
+Restart=on-failure
+UMask=0077
+
+[Install]
+WantedBy=default.target

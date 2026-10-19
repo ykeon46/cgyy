@@ -1,4 +1,4 @@
-"""北航场馆预约。默认只查询；提交订单、预览付款和自动付款均需显式参数。"""
+"""北航场馆预约。默认只查询；下单后可返回校园付二维码，由本人扫码付款。"""
 from __future__ import annotations
 
 import argparse
@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 import yaml
 from playwright.sync_api import Error as BrowserError, TimeoutError as BrowserTimeout
 from playwright.sync_api import Page, expect, sync_playwright
-from payment import AlipayPayment, ExpectedOrder, PaymentError, PaymentSettings, check_previous_result
+from payment import CampusQRCode, ExpectedOrder, PaymentError, amount
 from text_captcha import CaptchaError, TextCaptchaSolver
 from login_state import DEFAULT_SESSION_STATE, LoginState
 
@@ -29,6 +29,14 @@ DEFAULT_CONFIG = Path(__file__).parent / "configs" / "default.yaml"
 
 class ReservationError(Exception):
     """可以直接展示给用户的失败原因。"""
+
+
+class SubmissionRejected(ReservationError):
+    """服务器明确拒绝下单，与超时后结果未知区分。"""
+
+
+class TaskStopped(ReservationError):
+    pass
 
 
 def load_config(path: Path) -> dict:
@@ -70,9 +78,13 @@ def target_date(config: dict, today: date | None = None) -> date:
     return result
 
 
-def sleep_until(when: datetime) -> None:
+def sleep_until(when: datetime, check=None) -> None:
     while (remaining := (when - datetime.now(CHINA)).total_seconds()) > 0:
+        if check:
+            check()
         time.sleep(min(remaining, 1))
+    if check:
+        check()
 
 
 def wait_until(value: str) -> datetime:
@@ -437,7 +449,7 @@ class VenueClient:
             raise ReservationError("订单响应异常，请在个人中心核对，避免重复提交。")
         data = payload.get("data")
         if str(payload.get("code")) != "200" or not isinstance(data, dict) or not data.get("tradeNo"):
-            raise ReservationError("订单未确认成功：" + str(payload.get("message") or payload.get("msg") or "请查看网页提示"))
+            raise SubmissionRejected("订单未确认成功：" + str(payload.get("message") or payload.get("msg") or "请查看网页提示"))
         LOG.info("订单已提交（选场、表单、验证码及提交共 %.3f 秒）。请按页面倒计时付款。", time.monotonic() - started)
         return data
 
@@ -472,11 +484,9 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--check-login", action="store_true", help="仅检查统一认证登录")
     mode.add_argument("--list-venues", action="store_true", help="列出当前场馆名称")
     mode.add_argument("--submit", action="store_true", help="实际提交订单；默认手动付款")
-    payment_mode = parser.add_mutually_exclusive_group()
-    payment_mode.add_argument("--auto-pay", action="store_true", help="创建订单后用支付宝环境变量提交付款，可能实际扣款")
-    payment_mode.add_argument("--payment-preview", action="store_true", help="创建订单并打开支付宝账户付款页，不填写凭据、不提交付款")
-    parser.add_argument("--max-pay-amount", help="人民币单笔付款上限，覆盖 CGYY_MAX_PAY_AMOUNT")
-    parser.add_argument("--payment-result", type=Path, default=Path('artifacts/payment-result.json'), help="付款状态记录（不含凭据）")
+    parser.add_argument('--payment-qr', action='store_true', help='下单后获取官方付款二维码，由本人扫码支付')
+    parser.add_argument('--max-pay-amount', default=os.getenv('CGYY_MAX_PAY_AMOUNT','70.00'), help='订单金额上限')
+    parser.add_argument('--payment-result', type=Path, default=Path('artifacts/payment-result.json'))
     parser.add_argument("--date", help="预约日期 YYYY-MM-DD，覆盖配置")
     parser.add_argument("--at", help="指定北京时间开始，例如 2026-10-20T07:00:00")
     parser.add_argument("--headless", action="store_true", help="无界面浏览器；提交需同时指定付款预览或自动付款")
@@ -491,14 +501,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     try:
-        payment_enabled = args.auto_pay or args.payment_preview
-        if payment_enabled and not args.submit:
-            raise ReservationError('--auto-pay / --payment-preview 必须与 --submit 一起使用。')
-        if args.submit and args.headless and not payment_enabled:
-            raise ReservationError("--submit 请使用有界面浏览器，以便核对订单并手动付款。")
-        payment_settings = PaymentSettings.from_env(args.max_pay_amount, charge=args.auto_pay) if payment_enabled else None
-        if payment_enabled:
-            check_previous_result(args.payment_result)
+        if args.payment_qr and not args.submit:
+            raise ReservationError('--payment-qr 必须与 --submit 一起使用。')
+        if args.submit and args.headless and not args.payment_qr:
+            raise ReservationError('无界面下单请同时指定 --payment-qr。')
         config = load_config(args.config)
         captcha_solver = TextCaptchaSolver(args.captcha_repo, args.captcha_font) if args.captcha_repo else None
         if args.date:
@@ -548,27 +554,22 @@ def main(argv: list[str] | None = None) -> int:
                     return 3
                 LOG.info("可选：%s，%s 至 %s", chosen[0]["court"], chosen[0]["start"], chosen[-1]["end"])
                 if args.submit:
-                    if payment_enabled:
-                        expected = ExpectedOrder.from_choice('', config['venue'], desired, chosen, payment_settings.limit)
-                        budget = max(1, int((10 - (time.monotonic() - booking_started)) * 1000)) if args.fast else (45000 if captcha_solver else (15000 if args.headless else 120000))
-                        if args.fast and time.monotonic() - booking_started >= 10:
-                            raise ReservationError('查询已超过10秒预算，未提交订单。')
-                        order = client.submit(chosen, timeout=budget, captcha_solver=captcha_solver)
-                        LOG.info('本轮查询至订单确认耗时 %.3f 秒。', time.monotonic() - booking_started)
-                        expected = replace(expected, trade_no=order['tradeNo'])
-                        status = AlipayPayment(page, expected, payment_settings, args.payment_result, charge=args.auto_pay).run()
-                        LOG.info('付款流程状态：%s；记录：%s', status, args.payment_result)
-                        if not args.headless and not args.auto_pay:
-                            input('支付宝付款页已打开，未填写凭据或付款。按回车关闭浏览器：')
-                    else:
-                        try:
-                            budget = max(1, int((10 - (time.monotonic() - booking_started)) * 1000)) if args.fast else (45000 if captcha_solver else 15000)
-                            if args.fast and time.monotonic() - booking_started >= 10:
-                                raise ReservationError('查询已超过10秒预算，未提交订单。')
-                            client.submit(chosen, timeout=budget, captcha_solver=captcha_solver)
-                            LOG.info('本轮查询至订单确认耗时 %.3f 秒。', time.monotonic() - booking_started)
-                        finally:
-                            input("请在浏览器核对订单并按需付款，完成后按回车关闭浏览器：")
+                    expected = ExpectedOrder.from_choice('', config['venue'], desired, chosen, amount(args.max_pay_amount))
+                    budget = max(1,int((10-(time.monotonic()-booking_started))*1000)) if args.fast else 45000
+                    if args.fast and time.monotonic()-booking_started >= 10:
+                        raise ReservationError('查询超过10秒预算，未提交订单。')
+                    order = client.submit(chosen,timeout=budget,captcha_solver=captcha_solver)
+                    if args.payment_qr:
+                        import json
+                        payer = CampusQRCode(page,replace(expected,trade_no=order['tradeNo']))
+                        qr = payer.create()
+                        args.payment_result.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+                        args.payment_result.write_text(json.dumps(dict(qr,trade_no=order['tradeNo']),ensure_ascii=False))
+                        args.payment_result.chmod(0o600)
+                        LOG.info('付款二维码已保存至 %s，请在倒计时内扫码。',args.payment_result)
+                        payer.wait_for_payment(qr['expires_at'],lambda status,**details:LOG.info('订单状态：%s',status))
+                    elif not args.headless:
+                        input('请在场馆页面完成付款，按回车关闭浏览器：')
                 else:
                     LOG.info("只查询模式，未选择场地或提交订单。实际预约使用 --submit。")
             finally:
