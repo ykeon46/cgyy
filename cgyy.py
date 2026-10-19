@@ -426,32 +426,56 @@ class VenueClient:
                 received.append(response)
         self.page.on('response', observe)
         try:
-            remaining = int((deadline - time.monotonic()) * 1000)
-            if remaining <= 0:
-                raise ReservationError('选场准备已超过下单时间预算，未点击提交。')
-            # 不自动重试下单：超时也可能已经创建订单。
-            with self.page.expect_response(lambda r: urlparse(r.url).path.endswith("/api/reservation/order/submit"), timeout=remaining) as pending:
-                button.click()
-                if captcha_solver:
-                    while not received and time.monotonic() < deadline:
-                        if self.page.locator('.verifybox:visible').count():
-                            captcha_solver(self.page, timeout=max(1, int((deadline - time.monotonic()) * 1000)))
-                            break
-                        self.page.wait_for_timeout(100)
-            response = pending.value
-            payload = response.json()
+            for attempt in range(2):
+                remaining = int((deadline - time.monotonic()) * 1000)
+                if remaining <= 0:
+                    raise ReservationError('选场准备已超过下单时间预算，未点击提交。')
+                received.clear()
+                with self.page.expect_response(lambda r: urlparse(r.url).path.endswith("/api/reservation/order/submit"), timeout=remaining) as pending:
+                    button.click(timeout=remaining)
+                    if captcha_solver:
+                        while not received and time.monotonic() < deadline:
+                            if self.page.locator('.verifybox:visible').count():
+                                captcha_solver(self.page, timeout=max(1, int((deadline - time.monotonic()) * 1000)))
+                                break
+                            self.page.wait_for_timeout(100)
+                response = pending.value
+                payload = response.json()
+                if not response.ok or not isinstance(payload, dict):
+                    raise ReservationError("订单响应异常，请在个人中心核对，避免重复提交。")
+                data = payload.get("data")
+                if str(payload.get('code')) == '200':
+                    if not isinstance(data, dict) or not data.get('tradeNo'):
+                        raise ReservationError('订单响应缺少订单号，请先核对预约记录，不自动重试。')
+                    LOG.info("订单已提交（选场、表单、验证码及提交共 %.3f 秒）。请按页面倒计时付款。", time.monotonic() - started)
+                    return data
+                message = str(payload.get('message') or payload.get('msg') or '请查看网页提示')
+                if isinstance(data, dict) and data.get('tradeNo'):
+                    raise ReservationError('订单响应状态与订单号不一致：' + message + '；请先核对预约记录，不自动重试。')
+                rejection = SubmissionRejected('订单未确认成功：' + message)
+                # 只对明确的验证码拒绝重新验证一次。网络异常、超时、成功响应缺少
+                # 订单号等情况均可能已经下单，绝不再次提交。两次共用原时间预算。
+                if (attempt or not captcha_solver or str(payload.get('code')) != '400'
+                        or message != '验证码非法校验' or deadline - time.monotonic() < 2):
+                    raise rejection
+                try:
+                    modal = self.page.locator('.ivu-modal-wrap:visible').filter(has_text=message)
+                    modal.first.wait_for(timeout=min(1000, max(1, int((deadline-time.monotonic())*1000))))
+                    modal.first.get_by_role('button', name='确定', exact=True).click(timeout=max(1, int((deadline-time.monotonic())*1000)))
+                    expect(modal).to_have_count(0, timeout=max(1, int((deadline-time.monotonic())*1000)))
+                    # 等网站销毁上一轮验证窗口，下一次点击提交会生成全新的挑战。
+                    expect(self.page.locator('.verifybox:visible')).to_have_count(0, timeout=max(1, int((deadline-time.monotonic())*1000)))
+                    expect(button).not_to_have_class(re.compile(r'\bdisab\b'), timeout=max(1, int((deadline-time.monotonic())*1000)))
+                except (BrowserError, AssertionError):
+                    raise rejection from None
+                if deadline - time.monotonic() < 2:
+                    raise rejection
+                LOG.warning('场馆明确拒绝验证码且未返回订单号；重新完成一次验证，仍使用原下单时间预算。')
         except BrowserTimeout as error:
             notices = self.page.locator(".ivu-message-notice-content:visible,.ivu-modal-wrap:visible").all_inner_texts()
             raise ReservationError("未收到订单响应，请在网页核对订单或完成验证；不自动重试。 " + " ".join(notices)) from error
         finally:
             self.page.remove_listener('response', observe)
-        if not response.ok or not isinstance(payload, dict):
-            raise ReservationError("订单响应异常，请在个人中心核对，避免重复提交。")
-        data = payload.get("data")
-        if str(payload.get("code")) != "200" or not isinstance(data, dict) or not data.get("tradeNo"):
-            raise SubmissionRejected("订单未确认成功：" + str(payload.get("message") or payload.get("msg") or "请查看网页提示"))
-        LOG.info("订单已提交（选场、表单、验证码及提交共 %.3f 秒）。请按页面倒计时付款。", time.monotonic() - started)
-        return data
 
 
 def available_choice(slots: list[dict], config: dict) -> list[dict]:

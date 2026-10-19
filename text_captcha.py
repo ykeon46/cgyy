@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import sys
 import time
+from urllib.parse import urlparse
 
 LOG = logging.getLogger('cgyy')
 
@@ -75,38 +76,58 @@ class TextCaptchaSolver:
                 raise CaptchaError('验证码处理超时。')
             return min(ms, maximum)
 
-        for attempt in range(3):
-            image.wait_for(timeout=remaining())
-            page.wait_for_function('''() => {
-                const b = [...document.querySelectorAll('.verifybox')].find(b => b.offsetParent);
-                const i = b?.querySelector('.verify-img-panel img');
-                return i && i.complete && i.naturalWidth > 0;
-            }''', timeout=remaining())
-            source = image.get_attribute('src')
-            hint = box.inner_text()
-            try:
-                points, confidence = self.recognize(image.screenshot(), hint)
-            except CaptchaError:
-                if attempt == 2:
-                    raise
-                LOG.info('验证码识别不足，刷新验证图片。')
-                box.locator('.verify-refresh').click()
-            else:
-                LOG.info('验证码识别：%s；最低匹配分 %.3f', hint.splitlines()[-1], confidence)
-                for x, y in points:
-                    remaining()
-                    image.click(position={'x': x, 'y': y})
-                    page.wait_for_timeout(150)
-            result = page.wait_for_function('''previous => {
-                const b = [...document.querySelectorAll('.verifybox')].find(b => b.offsetParent);
-                if (!b) return 'closed';
-                const i = b.querySelector('.verify-img-panel img');
-                return i && i.complete && i.naturalWidth > 0 && i.getAttribute('src') !== previous
-                    ? 'refreshed' : false;
-            }''', arg=source, timeout=remaining()).json_value()
-            if result == 'closed':
-                LOG.info('点选验证码已通过。')
-                return
-            if attempt < 2:
-                LOG.info('验证码未通过，使用网站刷新后的图片（第 %s 次）。', attempt + 2)
-        raise CaptchaError('验证码连续三次未通过，未重复提交订单。')
+        checks = []
+        def observe(response):
+            if urlparse(response.url).path.endswith('/api/captcha/check'):
+                checks.append(response)
+        page.on('response', observe)
+        try:
+            for attempt in range(3):
+                check_start = len(checks)
+                image.wait_for(timeout=remaining())
+                page.wait_for_function('''() => {
+                    const b = [...document.querySelectorAll('.verifybox')].find(b => b.offsetParent);
+                    const i = b?.querySelector('.verify-img-panel img');
+                    return i && i.complete && i.naturalWidth > 0;
+                }''', timeout=remaining())
+                source = image.get_attribute('src')
+                hint = box.inner_text()
+                try:
+                    points, confidence = self.recognize(image.screenshot(), hint)
+                except CaptchaError:
+                    if attempt == 2:
+                        raise
+                    LOG.info('验证码识别不足，刷新验证图片。')
+                    box.locator('.verify-refresh').click()
+                else:
+                    LOG.info('验证码识别：%s；最低匹配分 %.3f', hint.splitlines()[-1], confidence)
+                    for x, y in points:
+                        remaining()
+                        image.click(position={'x': x, 'y': y}, timeout=remaining())
+                        page.wait_for_timeout(150)
+                result = page.wait_for_function('''previous => {
+                    const b = [...document.querySelectorAll('.verifybox')].find(b => b.offsetParent);
+                    if (!b) return 'closed';
+                    const i = b.querySelector('.verify-img-panel img');
+                    return i && i.complete && i.naturalWidth > 0 && i.getAttribute('src') !== previous
+                        ? 'refreshed' : false;
+                }''', arg=source, timeout=remaining()).json_value()
+                if result == 'closed':
+                    if not checks[check_start:]:
+                        raise CaptchaError('验证码窗口已关闭，但未收到服务器验证成功响应。')
+                    response = checks[-1]
+                    try:
+                        payload = response.json()
+                    except ValueError:
+                        raise CaptchaError('验证码校验响应异常，未确认验证通过。') from None
+                    data = payload.get('data') if isinstance(payload, dict) else None
+                    if (not response.ok or not isinstance(payload, dict) or str(payload.get('code')) != '200'
+                            or not isinstance(data, dict) or str(data.get('repCode')) != '0000'):
+                        raise CaptchaError('服务器未确认点选验证成功，请核对预约记录。')
+                    LOG.info('点选校验接口已确认通过，仍需等待订单接口确认。')
+                    return
+                if attempt < 2:
+                    LOG.info('验证码未通过，使用网站刷新后的图片（第 %s 次）。', attempt + 2)
+            raise CaptchaError('验证码连续三次未通过，未重复提交订单。')
+        finally:
+            page.remove_listener('response', observe)
