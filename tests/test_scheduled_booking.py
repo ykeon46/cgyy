@@ -31,6 +31,15 @@ class ScheduledBookingTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_account_mismatch_stops_before_login_or_submission(self):
+        self.job.config['account_username']='account-a'
+        with patch.object(self.job,'login') as login,patch('scheduled_booking.sleep_until') as wait:
+            with self.assertRaisesRegex(ReservationError,'账号不一致'):
+                self.job.run(MagicMock(),'account-b','dummy-password')
+        login.assert_not_called()
+        wait.assert_not_called()
+        self.assertFalse(self.job.state_path.exists())
+
     def test_shahe_is_rejected(self):
         self.config['venues'].append('沙河校区-综合馆-羽毛球')
         with patch('scheduled_booking.target_date', return_value=date(2026,10,21)):

@@ -70,6 +70,7 @@ class QRTests(unittest.TestCase):
         target=self.prepare_alipay_page()
         result=CampusQRCode(self.page,self.expected).create()
         self.assertEqual(result['qr_kind'],'alipay_payment')
+        self.assertEqual(result['alipay_url'],target)
         png=base64.b64decode(result['qr_code'].split(',',1)[1])
         decoded,_,_=cv2.QRCodeDetector().detectAndDecode(cv2.imdecode(np.frombuffer(png,dtype=np.uint8),cv2.IMREAD_COLOR))
         self.assertEqual(decoded,target)

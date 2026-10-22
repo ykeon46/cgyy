@@ -25,7 +25,7 @@ def local_environment():
             if not line or line.startswith('#') or '=' not in line:
                 continue
             key, value = line.split('=', 1)
-            if key in {'BUAA_SSO_USER','BUAA_SSO_PASSWORD','CGYY_MAX_PAY_AMOUNT','CGYY_BROWSER_BINARY'}:
+            if key in {'BUAA_SSO_USER','BUAA_SSO_PASSWORD','CGYY_MAX_PAY_AMOUNT','CGYY_BROWSER_BINARY','CGYY_MINIPROGRAM_KEY'}:
                 values = shlex.split(value,comments=True)
                 result[key] = values[0] if values else ''
     return result
@@ -50,6 +50,8 @@ def run():
     options={'headless':not bool(os.getenv('DISPLAY'))}
     if env.get('CGYY_BROWSER_BINARY'):options['executable_path']=env['CGYY_BROWSER_BINARY']
     if mode=='recheck':
+        if request.get('username',env.get('BUAA_SSO_USER'))!=env.get('BUAA_SSO_USER'):
+            raise ValueError('登录账号已切换，请刷新后重试。')
         with sync_playwright() as p:
             browser=p.chromium.launch(**options)
             try:

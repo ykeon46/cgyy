@@ -209,7 +209,9 @@ class BookingJob:
         return context, client
 
     def run(self, browser, user: str, password: str) -> int:
-        self.status('waiting_start')
+        if self.config.get('account_username',user)!=user:
+            raise ReservationError('预约配置与当前登录账号不一致，请重新保存预约规则。')
+        self.status('waiting_start',username=user)
         sleep_until(self.start,self.check_cancelled)
         if datetime.now(CHINA) >= self.stop:
             self.status('expired', message='已过本次任务截止时间，未尝试下单。')

@@ -5,3 +5,4 @@ configs/local.yaml
 configs/*.local.yaml
 .env
 artifacts/
+miniprogram/project.private.config.json

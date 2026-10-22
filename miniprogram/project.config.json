@@ -1,0 +1,16 @@
+{
+  "description": "北航羽毛球预约控制台小程序",
+  "miniprogramRoot": "./",
+  "compileType": "miniprogram",
+  "appid": "wx705fa17426014d2c",
+  "projectname": "cgyy-miniprogram",
+  "libVersion": "3.4.0",
+  "setting": {
+    "es6": true,
+    "enhance": true,
+    "minified": true,
+    "postcss": true,
+    "urlCheck": false
+  },
+  "condition": {}
+}

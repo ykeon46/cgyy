@@ -1,6 +1,9 @@
-"""本机预约控制台；默认只监听 127.0.0.1。"""
+"""本机预约控制台；默认只监听 127.0.0.1，小程序凭本机密钥访问。"""
 import argparse
+from contextlib import contextmanager
 from datetime import datetime
+import fcntl
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 import json
@@ -35,8 +38,66 @@ def write_json(path,value):
     temporary=path.with_suffix('.tmp');temporary.write_text(json.dumps(value,ensure_ascii=False));temporary.chmod(0o600);temporary.replace(path)
 
 
-def get_config():
-    return load_config(CONFIG if CONFIG.exists() else DEFAULT_CONFIG)
+def account_config_path(username):
+    return DATA/'accounts'/hashlib.sha256(username.encode()).hexdigest()/'config.yaml'
+
+
+def save_config(path, config):
+    path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+    temporary=path.with_suffix('.tmp')
+    temporary.write_text(yaml.safe_dump(config,allow_unicode=True))
+    temporary.chmod(0o600);temporary.replace(path)
+
+
+def get_config(username=None):
+    config=load_config(CONFIG if CONFIG.exists() else DEFAULT_CONFIG)
+    owner=config.get('account_username') or local_environment().get('BUAA_SSO_USER')
+    if username and owner!=username:
+        path=account_config_path(username)
+        return load_config(path if path.exists() else DEFAULT_CONFIG)
+    return config
+
+
+@contextmanager
+def execution_lock():
+    path=ROOT/'artifacts/booking-execution.lock'
+    path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+    with path.open('a') as lock:
+        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:raise ValueError('已有预约任务运行，请先停止任务或核对订单。')
+        yield
+
+
+def prepare_account_switch(previous):
+    if any(process.poll() is None for process in PROCESSES.values()) or any(
+            state['status'] in ACTIVE|{'needs_attention','qr_needs_attention'} for state in job_states(limit=None)):
+        raise ValueError('切换账号前，请先停止运行中的任务并核对未完成订单。')
+    if not previous:return
+    # 先停止未来触发，再更换凭据；未能关闭定时器时保留原账号。
+    try:subprocess.run(['systemctl','--user','disable','--now','cgyy-daily.timer'],check=True,capture_output=True)
+    except (OSError,subprocess.CalledProcessError):raise ValueError('无法关闭每日定时器，暂不能切换账号，请检查部署环境。')
+    config=get_config(previous)
+    config['account_username']=previous
+    save_config(account_config_path(previous),config)
+    # 旧版本没有账号字段，切换前将历史记录绑定到原账号。
+    for path in job_paths():
+        try:
+            state=json.loads(path.read_text())
+            if not state.get('username'):
+                state['username']=previous
+                write_json(path,state)
+        except (OSError,ValueError):continue
+
+
+def activate_account(username, previous):
+    if username==previous:
+        config=get_config(username)
+    else:
+        path=account_config_path(username)
+        config=load_config(path if path.exists() else DEFAULT_CONFIG)
+    config['account_username']=username
+    save_config(CONFIG,config)
+    save_config(account_config_path(username),config)
 
 
 def validate_config(value):
@@ -68,17 +129,26 @@ def validate_config(value):
     return base
 
 
-def job_states():
-    paths=list((DATA/'jobs').glob('*/status.json'))+list((ROOT/'artifacts/daily').glob('*/status.json'))
+def job_paths():
+    return list((DATA/'jobs').glob('*/status.json'))+list((ROOT/'artifacts/daily').glob('*/status.json'))
+
+
+def job_states(username=None, limit=30):
+    paths=job_paths()
+    legacy_owner=local_environment().get('BUAA_SSO_USER')
     result=[]
     for path in paths:
         try:
             state=json.loads(path.read_text())
+            if username and (state.get('username') or legacy_owner)!=username:continue
             state['id']=path.parent.name
             state['source']='daily' if 'daily' in path.parts else 'web'
             result.append(state)
         except (OSError,ValueError):continue
-    return sorted(result,key=lambda s:s.get('updated_at',''),reverse=True)[:30]
+    ordered=sorted(result,key=lambda s:s.get('updated_at',''),reverse=True)
+    if limit is None:return ordered
+    # 未完成任务不能被历史条数限制隐藏，否则用户无法核对后解除阻塞。
+    return ordered[:limit]+[state for state in ordered[limit:] if state['status'] in ACTIVE|{'needs_attention','qr_needs_attention'}]
 
 
 def spawn_worker(action,request):
@@ -138,6 +208,13 @@ def local_console_request(headers):
     except ValueError:return False
 
 
+def miniprogram_request(headers):
+    """小程序请求不带Origin和Cookie，改用.env中的访问密钥；未配置密钥时拒绝。"""
+    if headers.get('X-CGYY-Client')!='miniprogram':return False
+    key=local_environment().get('CGYY_MINIPROGRAM_KEY','')
+    return len(key)>=16 and secrets.compare_digest(headers.get('X-CGYY-Key','').encode(),key.encode())
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args):pass
 
@@ -150,11 +227,15 @@ class Handler(BaseHTTPRequestHandler):
         if cookie:self.send_header('Set-Cookie',cookie)
         self.end_headers();self.wfile.write(raw)
 
-    def session(self):
-        try:
-            cookie=SimpleCookie(self.headers.get('Cookie',''))
-            return SESSIONS.get(cookie['cgyy_session'].value)
+    def token(self):
+        if self.headers.get('X-CGYY-Client')=='miniprogram':
+            value=self.headers.get('Authorization','')
+            return value.removeprefix('Bearer ') if value.startswith('Bearer ') and miniprogram_request(self.headers) else None
+        try:return SimpleCookie(self.headers.get('Cookie',''))['cgyy_session'].value
         except (KeyError,ValueError):return None
+
+    def session(self):
+        return SESSIONS.get(self.token())
 
     def do_GET(self):
         path=urlparse(self.path).path
@@ -165,18 +246,21 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header('Cache-Control','no-store')
             self.send_header('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; frame-ancestors 'none'; form-action 'self'")
             self.end_headers();self.wfile.write(target.read_bytes());return
+        if self.headers.get('X-CGYY-Client')=='miniprogram' and not miniprogram_request(self.headers):
+            self.json({'error':'小程序访问密钥不正确，或服务器未配置 CGYY_MINIPROGRAM_KEY。'},403);return
         if path=='/api/session':
             self.json({'session':self.session(),'server_now':datetime.now(CHINA).isoformat()});return
         if not self.session():self.json({'error':'请先登录学校账号。'},401);return
         if path=='/api/config':
-            state=get_config();state.pop('sso',None)
+            state=get_config(self.session()['username']);state.pop('sso',None)
             enabled=subprocess.run(['systemctl','--user','is-enabled','cgyy-daily.timer'],capture_output=True,text=True).returncode==0
             self.json({'config':state,'daily_enabled':enabled});return
-        if path=='/api/jobs':self.json({'jobs':job_states(),'server_now':datetime.now(CHINA).isoformat()});return
+        if path=='/api/jobs':self.json({'jobs':job_states(self.session()['username']),'server_now':datetime.now(CHINA).isoformat()});return
         self.json({'error':'未找到接口。'},404)
 
     def do_POST(self):
-        if not local_console_request(self.headers):
+        miniprogram=miniprogram_request(self.headers)
+        if not (miniprogram or local_console_request(self.headers)):
             self.json({'error':'请求来源校验失败，请刷新当前控制台页面后重试。'},403);return
         try:
             length=int(self.headers.get('Content-Length','0'))
@@ -187,22 +271,34 @@ class Handler(BaseHTTPRequestHandler):
                 user,password=body.get('username','').strip(),body.get('password','')
                 if not isinstance(password,str) or not user or not password or len(user)>100 or len(password)>500:raise ValueError('请填写学校统一认证账号和密码。')
                 with MUTEX:
-                    answer=spawn_worker('login',{'username':user,'password':password})
-                token=secrets.token_urlsafe(32)
-                SESSIONS.clear()
-                SESSIONS[token]={key:answer[key] for key in ['username','buddies']}
+                    previous=local_environment().get('BUAA_SSO_USER','')
+                    if previous!=user:
+                        with execution_lock():
+                            prepare_account_switch(previous)
+                            answer=spawn_worker('login',{'username':user,'password':password})
+                            activate_account(user,previous)
+                    else:
+                        answer=spawn_worker('login',{'username':user,'password':password})
+                    token=secrets.token_urlsafe(32)
+                    SESSIONS.clear()
+                    SESSIONS[token]={key:answer[key] for key in ['username','buddies']}
+                if miniprogram:self.json({'session':SESSIONS[token],'token':token});return
                 self.json({'session':SESSIONS[token]},cookie=f'cgyy_session={token}; HttpOnly; SameSite=Strict; Path=/');return
             if not self.session():self.json({'error':'请先登录学校账号。'},401);return
             if path=='/api/logout':
-                cookie=SimpleCookie(self.headers.get('Cookie',''));SESSIONS.pop(cookie['cgyy_session'].value,None)
+                SESSIONS.pop(self.token(),None)
                 self.json({'ok':True},cookie='cgyy_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/');return
             if path=='/api/config':
                 config=validate_config(body['config'])
-                DATA.mkdir(parents=True,exist_ok=True,mode=0o700)
-                temporary=CONFIG.with_suffix('.tmp');temporary.write_text(yaml.safe_dump(config,allow_unicode=True));temporary.chmod(0o600);temporary.replace(CONFIG)
-                enabled=body.get('daily_enabled',False)
-                try:apply_schedule(config,enabled)
-                except (OSError,subprocess.CalledProcessError):raise ValueError('配置已保存，但系统定时器未更新，请按README检查部署环境。')
+                with MUTEX:
+                    session=self.session()
+                    if not session:self.json({'error':'请重新登录学校账号。'},401);return
+                    config['account_username']=session['username']
+                    save_config(CONFIG,config)
+                    save_config(account_config_path(session['username']),config)
+                    enabled=body.get('daily_enabled',False)
+                    try:apply_schedule(config,enabled)
+                    except (OSError,subprocess.CalledProcessError):raise ValueError('配置已保存，但系统定时器未更新，请按README检查部署环境。')
                 self.json({'ok':True});return
             if path=='/api/jobs':
                 config=validate_config(body['config'])
@@ -217,27 +313,45 @@ class Handler(BaseHTTPRequestHandler):
                     if not 5<=when.hour<23:raise ValueError('场馆每日23点至次日5点维护，请选择其他启动时间。')
                     if config.get('reserve_date') and when.date()>datetime.fromisoformat(config['reserve_date']).date():raise ValueError('开始预约的时间不能晚于预约日期。')
                 with MUTEX:
+                    session=self.session()
+                    if not session:self.json({'error':'请重新登录学校账号。'},401);return
+                    config['account_username']=session['username']
                     for process in PROCESSES.values():
                         if process.poll() is None:raise ValueError('已有任务正在运行，请先处理当前任务。')
-                    if any(state['status'] in {'needs_attention','qr_needs_attention','submitting','awaiting_payment'} for state in job_states()[:1]):
+                    if any(state['status'] in ACTIVE|{'needs_attention','qr_needs_attention'} for state in job_states(limit=None)):
                         raise ValueError('上一笔预约尚待核对，请先确认场馆订单状态，避免重复下单。')
                     task_id=uuid.uuid4().hex
                     directory=DATA/'jobs'/task_id;directory.mkdir(parents=True,mode=0o700)
                     (directory/'config.yaml').write_text(yaml.safe_dump(config,allow_unicode=True))
-                    write_json(directory/'status.json',{'status':'queued','updated_at':datetime.now(CHINA).isoformat(),'date':config.get('reserve_date'),'hours':config['reserve_time']})
+                    write_json(directory/'status.json',{'status':'queued','username':session['username'],'updated_at':datetime.now(CHINA).isoformat(),'date':config.get('reserve_date'),'hours':config['reserve_time']})
                     PROCESSES[task_id]=spawn_worker('book',{'directory':str(directory),'mode':mode,'run_at':run_at})
                 self.json({'id':task_id});return
             if path=='/api/cancel':
-                task_id=body.get('id','');state=next((state for state in job_states() if state['id']==task_id),None)
+                task_id=body.get('id','');state=next((state for state in job_states(self.session()['username'],limit=None) if state['id']==task_id),None)
                 if not state or state['status'] not in ACTIVE or state['status'] in {'submitting','locked','awaiting_payment'}:raise ValueError('当前阶段不能停止，请核对已生成的订单。')
                 target=(ROOT/'artifacts/daily' if state['source']=='daily' else DATA/'jobs')/task_id
                 (target/'cancel.request').write_text('stop')
                 self.json({'ok':True});return
+            if path=='/api/resolve':
+                with MUTEX,execution_lock():
+                    session=self.session()
+                    if not session:self.json({'error':'请重新登录学校账号。'},401);return
+                    task_id=body.get('id','')
+                    state=next((item for item in job_states(session['username'],limit=None) if item['id']==task_id),None)
+                    if not state or state['status']!='needs_attention' or state.get('trade_no') or body.get('confirmed_no_order') is not True:
+                        raise ValueError('仅可在官网确认没有有效或待付款订单后，结束无订单编号的异常任务。')
+                    if any(process.poll() is None for process in PROCESSES.values()):raise ValueError('请等待当前任务结束后再核对。')
+                    state.update(status='resolved',previous_status=state['status'],qr_code=None,
+                                 resolved_by=session['username'],updated_at=datetime.now(CHINA).isoformat(),
+                                 message='用户已在官网核对无有效或待付款订单，结束异常任务；未取消任何官方订单。')
+                    target=(ROOT/'artifacts/daily' if state['source']=='daily' else DATA/'jobs')/task_id/'status.json'
+                    write_json(target,state)
+                self.json({'ok':True});return
             if path=='/api/recheck':
                 task_id=body.get('id','')
-                state=next((item for item in job_states() if item['id']==task_id),None)
+                state=next((item for item in job_states(self.session()['username'],limit=None) if item['id']==task_id),None)
                 if not state or not state.get('trade_no'):raise ValueError('此任务还没有已确认的订单编号，请到场馆网站核对。')
-                result=spawn_worker('recheck',{'trade_no':state['trade_no']})
+                result=spawn_worker('recheck',{'trade_no':state['trade_no'],'username':self.session()['username']})
                 paid=str(result['payStatus'])=='2' and str(result['orderStatus'])=='1'
                 cancelled=str(result['orderStatus'])=='2' or str(result['payStatus']) in {'3','4','5'}
                 expired=bool(result.get('expireTime') and datetime.fromisoformat(result['expireTime']).replace(tzinfo=CHINA)<=datetime.now(CHINA))
@@ -255,11 +369,13 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--host',default='127.0.0.1',help='小程序直连时可改为局域网地址；公网请经HTTPS反向代理')
     parser.add_argument('--port',type=int,default=8765)
     args=parser.parse_args()
     os.chdir(ROOT);os.umask(0o077);DATA.mkdir(parents=True,exist_ok=True,mode=0o700)
-    server=ThreadingHTTPServer(('127.0.0.1',args.port),Handler)
+    server=ThreadingHTTPServer((args.host,args.port),Handler)
     print(f'预约控制台：http://127.0.0.1:{args.port}',flush=True)
+    if args.host not in {'127.0.0.1','localhost','::1'}:print(f'小程序接口监听 {args.host}:{args.port}，需在.env配置CGYY_MINIPROGRAM_KEY。',flush=True)
     server.serve_forever()
 
 

@@ -132,7 +132,7 @@ class CampusQRCode:
             image=qrcode.make(target,box_size=8,border=4)
             output=BytesIO();image.save(output,format='PNG')
             self.expected.verify(self.read_order())
-            return 'data:image/png;base64,'+base64.b64encode(output.getvalue()).decode()
+            return 'data:image/png;base64,'+base64.b64encode(output.getvalue()).decode(),target
         finally:
             cashier.close()
 
@@ -199,7 +199,7 @@ class CampusQRCode:
             'qr_kind':'campus_cashier','scan_tip':'校园付收银台入口，扫码后按官方页面选择支付方式，可能需要登录。'}
         if self.direct:
             try:
-                qr['qr_code']=self.alipay_qr(result['schoolPayUrl'],expires_at)
+                qr['qr_code'],qr['alipay_url']=self.alipay_qr(result['schoolPayUrl'],expires_at)
                 qr.update(qr_kind='alipay_payment',scan_tip='请使用已登录的手机支付宝扫码，在手机上确认付款。')
             except (BrowserError,PaymentError,ImportError,ValueError) as error:
                 reason=str(error) if isinstance(error,PaymentError) else type(error).__name__

@@ -1,0 +1,23 @@
+page{background:var(--paper)}
+.hero{position:relative;overflow:hidden;background:linear-gradient(160deg,#12493a 0%,#1a6851 70%,#2a7a5f 100%);color:#fff;padding:40rpx 40rpx 96rpx}
+.court{position:absolute;right:-120rpx;top:40rpx;width:420rpx;height:300rpx;transform:rotate(-24deg);opacity:.22}
+.court-outer{position:absolute;top:0;left:0;right:0;bottom:0;border:4rpx solid #cfe6d4}
+.court-inner{position:absolute;top:48rpx;bottom:48rpx;left:0;right:0;border-top:3rpx solid #cfe6d4;border-bottom:3rpx solid #cfe6d4}
+.court-net{position:absolute;top:0;bottom:0;left:50%;border-left:6rpx dashed #ffffff}
+.brand{position:relative;display:flex;align-items:center;gap:20rpx;margin-bottom:64rpx}
+.brand-icon{width:76rpx;height:80rpx;border-radius:22rpx;background:rgba(255,255,255,.14);border:2rpx solid rgba(255,255,255,.25);color:#fff;font-family:serif;font-size:40rpx;display:flex;align-items:center;justify-content:center}
+.brand-name{display:block;font-weight:700;letter-spacing:4rpx;font-size:28rpx}
+.brand-sub{display:block;color:rgba(255,255,255,.7);font-size:22rpx;margin-top:4rpx}
+.hero-eyebrow{position:relative;display:block;font-size:20rpx;letter-spacing:6rpx;color:rgba(255,255,255,.65);font-weight:600}
+.hero-title{position:relative;display:block;font-size:56rpx;font-weight:700;line-height:1.35;margin:16rpx 0 20rpx}
+.hero-sub{position:relative;display:block;color:rgba(255,255,255,.75);font-size:26rpx}
+.sheet{position:relative;margin-top:-56rpx;padding:0 32rpx 64rpx}
+.server-summary{display:flex;align-items:center;gap:20rpx;margin-top:20rpx;padding:20rpx 24rpx;border-radius:18rpx;background:#fafbf8;border:2rpx solid var(--line)}
+.server-dot{width:16rpx;height:16rpx;border-radius:50%;background:var(--faint);flex:none}
+.server-dot.ok{background:#36a26f;box-shadow:0 0 0 6rpx rgba(54,162,111,.15)}
+.server-text{flex:1;min-width:0}
+.server-host{display:block;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.server-text .hint{margin-top:0}
+.test-button{margin-top:28rpx!important}
+.login-button{margin-top:28rpx!important}
+.note{display:block;color:var(--muted);font-size:22rpx;line-height:1.7;margin-top:24rpx}

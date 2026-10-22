@@ -1,0 +1,23 @@
+// 视图层格式化：日期、场馆与场地摘要。
+var WEEK = ['日', '一', '二', '三', '四', '五', '六'];
+
+function day(value) {
+  if (!value) return '';
+  var p = value.split('-');
+  var d = getDate(parseInt(p[0], 10), parseInt(p[1], 10) - 1, parseInt(p[2], 10));
+  return parseInt(p[1], 10) + '月' + parseInt(p[2], 10) + '日 周' + WEEK[d.getDay()];
+}
+
+function venues(halls) {
+  var names = [];
+  for (var i = 0; i < halls.length; i++) if (halls[i].checked) names.push(i === 0 ? '主馆' : '副馆');
+  return names.length ? names.join(' / ') : '未选场馆';
+}
+
+function courts(list) {
+  var count = 0;
+  for (var i = 0; i < list.length; i++) if (list[i].selected) count++;
+  return count ? '优先' + count + '块场地' : '任意场地';
+}
+
+module.exports = {day: day, venues: venues, courts: courts};

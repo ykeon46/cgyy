@@ -1,6 +1,7 @@
 import json
 from datetime import datetime,timedelta
 import os
+import shutil
 from http.server import ThreadingHTTPServer
 import threading
 from pathlib import Path
@@ -15,6 +16,29 @@ from playwright.sync_api import sync_playwright
 
 
 class WebTests(unittest.TestCase):
+    def setUp(self):
+        directory=tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root=Path(directory.name)
+        shutil.copytree(web_app.ROOT/'deploy',self.root/'deploy')
+        for name,value in [('ROOT',self.root),('DATA',self.root/'artifacts/web'),('CONFIG',self.root/'artifacts/web/config.yaml')]:
+            patcher=patch.object(web_app,name,value);patcher.start();self.addCleanup(patcher.stop)
+        for patcher in [patch('web_app.local_environment',return_value={}),
+                        patch.dict(web_app.SESSIONS,{},clear=True),patch.dict(web_app.PROCESSES,{},clear=True)]:
+            patcher.start();self.addCleanup(patcher.stop)
+
+    def request(self,path,body=None,token='test-token'):
+        headers={'X-CGYY-Client':'1','Cookie':'cgyy_session='+token,'Content-Type':'application/json'}
+        with urlopen(Request(self.url+path,data=json.dumps(body).encode() if body is not None else None,headers=headers)) as response:
+            return json.load(response)
+
+    def job(self,task_id,status='needs_attention',username='account-a',**details):
+        path=web_app.DATA/'jobs'/task_id/'status.json'
+        state=dict(status=status,username=username,updated_at=datetime.now(web_app.CHINA).isoformat())
+        state.update(details)
+        web_app.write_json(path,state)
+        return path
+
     @classmethod
     def setUpClass(cls):
         cls.server=ThreadingHTTPServer(('127.0.0.1',0),web_app.Handler)
@@ -74,6 +98,151 @@ class WebTests(unittest.TestCase):
             with urlopen(request) as response:
                 self.assertIn('HttpOnly',response.headers.get('Set-Cookie'))
                 self.assertNotIn('not-returned',response.read().decode())
+    def test_miniprogram_requires_configured_access_key(self):
+        headers={'Content-Type':'application/json','X-CGYY-Client':'miniprogram','X-CGYY-Key':'k'*24}
+        for configured in [{},{'CGYY_MINIPROGRAM_KEY':'short'},{'CGYY_MINIPROGRAM_KEY':'x'*24}]:
+            with self.subTest(configured=configured),patch('web_app.local_environment',return_value=configured),patch('web_app.spawn_worker') as worker:
+                for request in [Request(self.url+'/api/session',headers=headers),
+                                Request(self.url+'/api/login',data=json.dumps({'username':'u','password':'p'}).encode(),headers=headers)]:
+                    with self.assertRaises(HTTPError) as error:urlopen(request)
+                    self.assertEqual(error.exception.code,403)
+                worker.assert_not_called()
+    def test_miniprogram_login_returns_bearer_token_without_cookie(self):
+        key='k'*24;headers={'Content-Type':'application/json','X-CGYY-Client':'miniprogram','X-CGYY-Key':key}
+        with patch.dict(web_app.SESSIONS,{},clear=True),patch('web_app.local_environment',return_value={'CGYY_MINIPROGRAM_KEY':key}),\
+             patch('web_app.spawn_worker',return_value={'username':'mp-user','buddies':[]}):
+            request=Request(self.url+'/api/login',data=json.dumps({'username':'mp-user','password':'not-returned'}).encode(),headers=headers)
+            with urlopen(request) as response:
+                self.assertIsNone(response.headers.get('Set-Cookie'))
+                data=json.load(response)
+            self.assertEqual(data['session']['username'],'mp-user');self.assertNotIn('not-returned',json.dumps(data))
+            with urlopen(Request(self.url+'/api/jobs',headers={**headers,'Authorization':'Bearer '+data['token']})) as response:
+                self.assertIn('jobs',json.load(response))
+            for changed in [{'Authorization':'Bearer wrong'},{'Authorization':'Bearer '+data['token'],'X-CGYY-Key':'w'*24}]:
+                with self.subTest(changed=changed),self.assertRaises(HTTPError) as error:urlopen(Request(self.url+'/api/jobs',headers={**headers,**changed}))
+                self.assertIn(error.exception.code,{401,403})
+            # 浏览器Cookie不能冒充小程序的Bearer令牌。
+            with self.assertRaises(HTTPError) as error:urlopen(Request(self.url+'/api/jobs',headers={**headers,'Cookie':'cgyy_session='+data['token']}))
+            self.assertEqual(error.exception.code,401)
+
+    def test_account_history_and_mutations_are_isolated(self):
+        web_app.SESSIONS['test-token']={'username':'account-b','buddies':[]}
+        self.job('a-task',trade_no='a-trade')
+        self.job('b-task',status='paid',username='account-b')
+        self.assertEqual([job['id'] for job in self.request('/api/jobs')['jobs']],['b-task'])
+        with patch('web_app.spawn_worker') as worker:
+            for endpoint,body in [('/api/recheck',{'id':'a-task'}),('/api/cancel',{'id':'a-task'}),('/api/resolve',{'id':'a-task','confirmed_no_order':True})]:
+                with self.subTest(endpoint=endpoint),self.assertRaises(HTTPError) as error:self.request(endpoint,body)
+                self.assertEqual(error.exception.code,400)
+            worker.assert_not_called()
+
+    def test_resolve_requires_explicit_confirmation_and_no_order(self):
+        web_app.SESSIONS['test-token']={'username':'account-a','buddies':[]}
+        path=self.job('uncertain')
+        for confirmation in [None,False,'true']:
+            with self.subTest(confirmation=confirmation),self.assertRaises(HTTPError):
+                self.request('/api/resolve',{'id':'uncertain','confirmed_no_order':confirmation})
+        self.request('/api/resolve',{'id':'uncertain','confirmed_no_order':True})
+        state=json.loads(path.read_text())
+        self.assertEqual(state['status'],'resolved')
+        self.assertEqual(state['resolved_by'],'account-a')
+        self.assertEqual(state['previous_status'],'needs_attention')
+        self.job('with-order',trade_no='real-order')
+        self.job('running',status='submitting')
+        for task_id in ['with-order','running']:
+            with self.subTest(task_id=task_id),self.assertRaises(HTTPError):
+                self.request('/api/resolve',{'id':task_id,'confirmed_no_order':True})
+
+    def test_resolve_cannot_race_with_running_daily_worker(self):
+        web_app.SESSIONS['test-token']={'username':'account-a','buddies':[]}
+        self.job('uncertain')
+        with web_app.execution_lock(),self.assertRaises(HTTPError):
+            self.request('/api/resolve',{'id':'uncertain','confirmed_no_order':True})
+        self.assertEqual(web_app.job_states()[0]['status'],'needs_attention')
+
+    def test_account_switch_archives_legacy_data_and_restores_own_config(self):
+        config=web_app.load_config(web_app.DEFAULT_CONFIG)
+        config['phone']='13800000001'
+        web_app.save_config(web_app.CONFIG,config)
+        path=self.job('legacy-paid',status='paid');state=json.loads(path.read_text());state.pop('username');web_app.write_json(path,state)
+        with patch('web_app.local_environment',return_value={'BUAA_SSO_USER':'account-a'}),patch('web_app.subprocess.run') as systemctl:
+            web_app.prepare_account_switch('account-a')
+            web_app.activate_account('account-b','account-a')
+            systemctl.assert_called_once()
+        self.assertEqual(json.loads(path.read_text())['username'],'account-a')
+        self.assertEqual(web_app.load_config(web_app.CONFIG)['phone'],'')
+        with patch('web_app.local_environment',return_value={'BUAA_SSO_USER':'account-b'}),patch('web_app.subprocess.run'):
+            self.assertEqual(web_app.job_states('account-b'),[])
+            web_app.prepare_account_switch('account-b')
+            web_app.activate_account('account-a','account-b')
+        self.assertEqual(web_app.load_config(web_app.CONFIG)['phone'],'13800000001')
+        self.assertEqual(web_app.load_config(web_app.CONFIG)['account_username'],'account-a')
+
+    def test_account_switch_rejects_unresolved_task_before_login(self):
+        self.job('uncertain')
+        with patch('web_app.local_environment',return_value={'BUAA_SSO_USER':'account-a'}),patch('web_app.spawn_worker') as worker:
+            with self.assertRaises(HTTPError):self.request('/api/login',{'username':'account-b','password':'dummy'})
+            worker.assert_not_called()
+
+    def test_login_switch_disables_timer_and_keeps_old_history_private(self):
+        environment={'BUAA_SSO_USER':'account-a'}
+        config=web_app.load_config(web_app.DEFAULT_CONFIG)
+        config['phone']='13800000001'
+        web_app.save_config(web_app.CONFIG,config)
+        self.job('old-paid',status='paid')
+        def login(action,request):
+            self.assertEqual(action,'login')
+            environment['BUAA_SSO_USER']=request['username']
+            return {'username':request['username'],'buddies':[]}
+        with patch('web_app.local_environment',side_effect=lambda:dict(environment)),patch('web_app.spawn_worker',side_effect=login),patch('web_app.subprocess.run') as timer:
+            result=self.request('/api/login',{'username':'account-b','password':'dummy'})
+            self.assertEqual(result['session']['username'],'account-b')
+            token=next(iter(web_app.SESSIONS))
+            self.assertEqual(self.request('/api/jobs',token=token)['jobs'],[])
+            self.assertEqual(self.request('/api/config',token=token)['config']['phone'],'')
+            self.assertIn(['systemctl','--user','disable','--now','cgyy-daily.timer'],[call.args[0] for call in timer.call_args_list])
+
+    def test_account_switch_aborts_if_daily_timer_cannot_be_disabled(self):
+        import subprocess
+        with patch('web_app.local_environment',return_value={'BUAA_SSO_USER':'account-a'}),\
+                patch('web_app.subprocess.run',side_effect=subprocess.CalledProcessError(1,'systemctl')),\
+                patch('web_app.spawn_worker') as worker:
+            with self.assertRaises(HTTPError):self.request('/api/login',{'username':'account-b','password':'dummy'})
+            worker.assert_not_called()
+
+    def test_older_unresolved_task_blocks_booking_until_manually_resolved(self):
+        web_app.SESSIONS['test-token']={'username':'account-a','buddies':[]}
+        self.job('old-uncertain',updated_at='2000-01-01T00:00:00+08:00')
+        self.job('recent-paid',status='paid')
+        run_at=(datetime.now(web_app.CHINA)+timedelta(days=1)).replace(hour=7,minute=0,second=0).isoformat()
+        body={'mode':'once','run_at':run_at,'config':{}}
+        with patch('web_app.spawn_worker') as worker:
+            with self.assertRaises(HTTPError):self.request('/api/jobs',body)
+            worker.assert_not_called()
+            self.request('/api/resolve',{'id':'old-uncertain','confirmed_no_order':True})
+            result=self.request('/api/jobs',body)
+            self.assertIn('id',result)
+            worker.assert_called_once()
+
+    def test_account_switch_rejects_running_process_even_before_state_update(self):
+        from unittest.mock import Mock
+        web_app.PROCESSES['starting']=Mock();web_app.PROCESSES['starting'].poll.return_value=None
+        with patch('web_app.spawn_worker') as worker:
+            with self.assertRaises(HTTPError):self.request('/api/login',{'username':'account-b','password':'dummy'})
+            worker.assert_not_called()
+
+    def test_unresolved_tasks_remain_visible_beyond_history_limit(self):
+        self.job('old-uncertain',updated_at='2000-01-01T00:00:00+08:00')
+        for index in range(31):self.job('paid-'+str(index),status='paid')
+        self.assertIn('old-uncertain',[job['id'] for job in web_app.job_states('account-a')])
+
+    def test_config_ignores_client_account_and_is_saved_for_session_owner(self):
+        web_app.SESSIONS['test-token']={'username':'account-a','buddies':[]}
+        with patch('web_app.apply_schedule'):
+            self.request('/api/config',{'config':{'account_username':'account-b'},'daily_enabled':False})
+        self.assertEqual(web_app.load_config(web_app.CONFIG)['account_username'],'account-a')
+        self.assertTrue(web_app.account_config_path('account-a').exists())
+        self.assertFalse(web_app.account_config_path('account-b').exists())
 
 
 class BrowserUITests(unittest.TestCase):

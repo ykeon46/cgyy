@@ -1,0 +1,37 @@
+<view class="hero">
+  <view class="court" aria-hidden="true"><view class="court-outer"></view><view class="court-inner"></view><view class="court-net"></view></view>
+  <view class="brand"><text class="brand-icon">羽</text><view><text class="brand-name">COURTSIDE</text><text class="brand-sub">学院路 · 主馆 / 副馆</text></view></view>
+  <text class="hero-eyebrow">MAKE TIME TO PLAY</text>
+  <text class="hero-title">把时间留给\n下一场好球。</text>
+  <text class="hero-sub">选好场次，准备上场。从预约到付款，一处完成。</text>
+</view>
+
+<view class="sheet">
+  <view class="card server-card">
+    <view class="card-heading"><text class="step-number">01</text><text class="h2">预约服务器</text><text wx:if="{{connected}}" class="tag">已连接</text></view>
+    <view wx:if="{{!editingServer}}" class="server-summary" bindtap="editServer">
+      <view class="server-dot {{connected ? 'ok' : ''}}"></view>
+      <view class="server-text"><text class="server-host">{{serverHost}}</text><text class="hint">访问密钥已保存在本机</text></view>
+      <text class="text-button">修改</text>
+    </view>
+    <block wx:else>
+      <text class="label">服务器地址</text>
+      <input class="input" value="{{server}}" placeholder="https://cgyy.example.com" placeholder-class="placeholder" bindinput="onServer" type="text" />
+      <view class="row-between"><text class="label">访问密钥</text><text class="text-button" bindtap="toggleKey">{{showKey ? '隐藏' : '显示'}}</text></view>
+      <input class="input" value="{{key}}" placeholder="至少16位，见服务器 .env" placeholder-class="placeholder" bindinput="onKey" password="{{!showKey}}" />
+      <text class="hint">对应服务器 .env 中的 CGYY_MINIPROGRAM_KEY，仅保存在本机微信存储。</text>
+      <button class="secondary test-button" loading="{{checking}}" disabled="{{checking}}" bindtap="checkServer">测试连接</button>
+    </block>
+  </view>
+
+  <view class="card">
+    <view class="card-heading"><text class="step-number">02</text><text class="h2">学校统一认证</text></view>
+    <text class="label">学号 / 工号</text>
+    <input class="input" value="{{username}}" placeholder="请输入学校账号" placeholder-class="placeholder" bindinput="onUsername" maxlength="100" />
+    <text class="label">统一认证密码</text>
+    <input class="input" value="{{password}}" placeholder="请输入学校密码" placeholder-class="placeholder" bindinput="onPassword" password maxlength="500" bindconfirm="login" />
+    <text class="error">{{error}}</text>
+    <button class="primary login-button" loading="{{loggingIn}}" disabled="{{loggingIn}}" bindtap="login">{{loggingIn ? '正在连接统一认证…' : '登录并继续'}}</button>
+    <text class="note">首次登录约需30秒。学校账号由服务器用于登录及每日任务；付款只需扫码，无需填写支付宝账号或支付密码。</text>
+  </view>
+</view>

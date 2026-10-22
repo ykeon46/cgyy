@@ -1,0 +1,38 @@
+{
+  "pages": [
+    "pages/index/index",
+    "pages/history/history",
+    "pages/login/login"
+  ],
+  "window": {
+    "navigationBarBackgroundColor": "#f6f7f2",
+    "navigationBarTextStyle": "black",
+    "navigationBarTitleText": "北航场馆预约",
+    "backgroundColor": "#f6f7f2"
+  },
+  "tabBar": {
+    "color": "#809087",
+    "selectedColor": "#1a6851",
+    "backgroundColor": "#ffffff",
+    "borderStyle": "white",
+    "list": [
+      {
+        "pagePath": "pages/index/index",
+        "text": "预约",
+        "iconPath": "images/tab-booking.png",
+        "selectedIconPath": "images/tab-booking-active.png"
+      },
+      {
+        "pagePath": "pages/history/history",
+        "text": "记录",
+        "iconPath": "images/tab-history.png",
+        "selectedIconPath": "images/tab-history-active.png"
+      }
+    ]
+  },
+  "networkTimeout": {
+    "request": 120000
+  },
+  "sitemapLocation": "sitemap.json",
+  "style": "v2"
+}

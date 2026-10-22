@@ -1,0 +1,164 @@
+<wxs module="fmt" src="../../utils/format.wxs" />
+<view class="hero">
+  <view class="hero-top">
+    <view class="hero-brand"><text class="brand-icon">羽</text><text class="brand-name">COURTSIDE</text></view>
+    <view class="account" bindtap="logout"><text class="account-name">{{username || '已登录'}}</text><text class="avatar">B</text></view>
+  </view>
+  <text class="hero-eyebrow">YOUR NEXT SESSION · {{today}}</text>
+  <text class="hero-title">预约下一场。</text>
+  <view class="summary">
+    <view class="summary-item"><text class="summary-label">日期</text><text class="summary-value">{{fmt.day(reserveDate)}}</text></view>
+    <view class="summary-item"><text class="summary-label">时段</text><text class="summary-value">{{startLabels[startIndex]}}–{{endLabels[endIndex]}}</text></view>
+    <view class="summary-item"><text class="summary-label">场馆</text><text class="summary-value">{{fmt.venues(halls)}}</text></view>
+  </view>
+</view>
+
+<view class="page">
+  <view wx:if="{{loading || !ready || networkError}}" class="card">
+    <text wx:if="{{loading}}" class="hint">正在同步配置和预约状态…</text>
+    <text wx:elif="{{!ready}}" class="error">{{formError || '配置尚未加载成功，请重试。'}}</text>
+    <text wx:if="{{networkError}}" class="error">{{networkError}}</text>
+    <text wx:if="{{!loading}}" class="chip-button" bindtap="onPullDownRefresh">重新连接</text>
+  </view>
+  <!-- 状态卡始终位于最上方：订单生成后无需滚动即可扫码 -->
+  <view id="payment" class="card status-card {{pay.pending ? 'is-live' : pay.paid ? 'is-paid' : ''}}">
+    <block wx:if="{{pay}}">
+      <view class="row-between"><text class="eyebrow">{{pay.pending || pay.paid ? 'PAYMENT' : 'CURRENT TASK'}}</text><text class="badge {{pay.tone}}">{{pay.badge}}</text></view>
+      <text class="pay-title">{{pay.title}}</text>
+      <text class="pay-sub">{{pay.subtitle}}</text>
+
+      <view wx:if="{{pay.pending || pay.paid}}" class="qr-frame {{pay.paid ? 'done' : ''}}">
+        <view class="corner tl"></view><view class="corner tr"></view><view class="corner bl"></view><view class="corner br"></view>
+        <image wx:if="{{live && qr}}" class="qr" src="{{qr}}" mode="aspectFit" />
+        <view wx:else class="qr-placeholder"><text class="qr-icon">{{pay.paid ? '✓' : '⌛'}}</text><text class="qr-placeholder-title">{{pay.placeholder}}</text></view>
+      </view>
+
+      <view wx:if="{{pay.pending}}" class="countdown-wrap">
+        <view class="row-between"><text class="muted">请在倒计时内完成付款</text><text class="countdown">{{countdown}}</text></view>
+        <view class="progress-track"><view class="progress" style="width:{{progress}}%"></view></view>
+      </view>
+
+      <view wx:if="{{live}}" class="pay-actions">
+        <button wx:if="{{pay.alipayUrl}}" class="primary" bindtap="copyLink" data-kind="alipay">复制支付宝付款链接</button>
+        <button wx:elif="{{pay.cashierUrl}}" class="primary" bindtap="copyLink" data-kind="cashier">复制官方收银台链接</button>
+        <button class="secondary" bindtap="saveQr">保存二维码到相册</button>
+        <text class="hint center">本机付款：复制链接到浏览器打开会跳转支付宝；或保存后在支付宝扫一扫中选相册。</text>
+      </view>
+
+      <view wx:if="{{pay.hasOrder}}" class="order-details">
+        <view class="order-row" wx:for="{{pay.details}}" wx:key="k"><text class="muted">{{item.k}}</text><text class="{{item.k === '应付金额' ? 'amount' : 'order-value'}}">{{item.v}}</text></view>
+      </view>
+
+      <view class="steps">
+        <view class="step {{item.state}}" wx:for="{{pay.steps}}" wx:key="k">
+          <view class="step-rail"><text class="step-icon">{{item.state === 'done' ? '✓' : index + 1}}</text><view wx:if="{{index < pay.steps.length - 1}}" class="step-line"></view></view>
+          <text class="step-text">{{item.text}}</text>
+        </view>
+      </view>
+      <text class="task-message">{{pay.message}}</text>
+
+      <view class="status-links">
+        <text wx:if="{{pay.hasOrder}}" class="chip-button" bindtap="recheck">核对订单状态</text>
+        <text wx:if="{{pay.cancellable}}" class="chip-button danger" bindtap="cancelJob">停止任务</text>
+        <text wx:if="{{pay.resolvable}}" class="chip-button" bindtap="resolveJob">官网核对后结束异常任务</text>
+        <text wx:if="{{pinned}}" class="chip-button" bindtap="followLatest">回到最新任务</text>
+      </view>
+    </block>
+    <view wx:else class="idle">
+      <view class="idle-icon"><view class="idle-dot {{dailyEnabled ? 'on' : ''}}"></view></view>
+      <view class="idle-text">
+        <text class="idle-title">暂无进行中的任务</text>
+        <text class="hint">{{dailyEnabled ? '每日自动已开启 · 每天 ' + releaseAt + ' 开始预约' : '配置好场次后，点击下方按钮预约。'}}</text>
+      </view>
+    </view>
+  </view>
+
+  <view class="card">
+    <view class="card-heading"><text class="step-number">01</text><text class="h2">预约场次</text><text class="tag">羽毛球</text></view>
+
+    <text class="label">选择场馆<text class="label-note">至少一个，按顺序尝试</text></text>
+    <view class="venues">
+      <view class="venue {{item.checked ? 'selected' : ''}}" wx:for="{{halls}}" wx:key="name" bindtap="toggleHall" data-index="{{index}}">
+        <view class="row-between"><text class="venue-title">{{item.title}}</text><text class="check">✓</text></view>
+        <text class="venue-sub">{{item.sub}}</text>
+      </view>
+    </view>
+
+    <text class="label">预约日期</text>
+    <view class="two">
+      <picker mode="date" value="{{reserveDate}}" start="{{dateStart}}" end="{{dateEnd}}" bindchange="onDate"><view class="picker">{{fmt.day(reserveDate) || '选择日期'}}</view></picker>
+      <picker range="{{days}}" value="{{daysIndex}}" bindchange="onDays"><view class="picker"><text class="picker-prefix">每日提前</text>{{days[daysIndex]}}</view></picker>
+    </view>
+    <text class="hint">立即预约使用所选日期；每日任务按提前天数滚动。</text>
+
+    <text class="label">预约时段<text class="label-note">连续整小时 · {{duration}}</text></text>
+    <view class="time-range">
+      <picker class="time-picker" range="{{startLabels}}" value="{{startIndex}}" bindchange="onStart"><view class="picker">{{startLabels[startIndex]}}</view></picker>
+      <text class="range-line">至</text>
+      <picker class="time-picker" range="{{endLabels}}" value="{{endIndex}}" bindchange="onEnd"><view class="picker">{{endLabels[endIndex]}}</view></picker>
+    </view>
+
+    <view class="row-between label-row"><text class="label">场地偏好<text class="label-note">{{fmt.courts(courts)}}</text></text><text class="text-button" bindtap="anyCourt">清空</text></view>
+    <view class="courts">
+      <text class="court {{item.selected ? 'selected' : ''}}" wx:for="{{courts}}" wx:key="n" bindtap="toggleCourt" data-index="{{index}}">{{item.n}}</text>
+    </view>
+    <text class="hint">1–12 号为主馆，17–24 号为副馆。不选则任意场地；选中后优先尝试。</text>
+  </view>
+
+  <view class="card">
+    <view class="card-heading"><text class="step-number">02</text><text class="h2">预约安排</text></view>
+    <view class="segmented">
+      <text class="{{mode === 'now' ? 'selected' : ''}}" bindtap="setMode" data-mode="now">立即预约</text>
+      <text class="{{mode === 'once' ? 'selected' : ''}}" bindtap="setMode" data-mode="once">定时预约</text>
+      <text class="{{mode === 'daily' ? 'selected' : ''}}" bindtap="setMode" data-mode="daily">每日自动</text>
+    </view>
+    <text class="mode-hint">{{modeHint}}</text>
+
+    <view wx:if="{{mode === 'once'}}">
+      <text class="label">开始预约的时间（北京时间）</text>
+      <view class="two">
+        <picker mode="date" value="{{runDate}}" start="{{dateStart}}" end="{{dateEnd}}" bindchange="onRunDate"><view class="picker">{{fmt.day(runDate)}}</view></picker>
+        <picker mode="time" value="{{runTime}}" start="05:00" end="22:59" bindchange="onRunTime"><view class="picker">{{runTime}}</view></picker>
+      </view>
+    </view>
+
+    <view wx:if="{{mode === 'daily'}}">
+      <view class="three">
+        <view><text class="label">提前登录</text><picker mode="time" value="{{loginAt}}" data-field="loginAt" bindchange="onTime"><view class="picker">{{loginAt}}</view></picker></view>
+        <view><text class="label">开始预约</text><picker mode="time" value="{{releaseAt}}" data-field="releaseAt" bindchange="onTime"><view class="picker">{{releaseAt}}</view></picker></view>
+        <view><text class="label">最晚截止</text><picker mode="time" value="{{stopAt}}" data-field="stopAt" bindchange="onTime"><view class="picker">{{stopAt}}</view></picker></view>
+      </view>
+      <view class="switch-row strong"><view><text>启用每日自动预约</text><text class="hint">保存后同步到服务器定时器</text></view><switch checked="{{dailyEnabled}}" color="#1a6851" bindchange="onDailyEnabled" /></view>
+    </view>
+
+    <view class="advanced-toggle" bindtap="toggleAdvanced">
+      <view><text class="advanced-title">更多配置</text><text class="hint">同伴、联系电话、金额上限与登录</text></view>
+      <text class="chevron {{advanced ? 'open' : ''}}"></text>
+    </view>
+    <view wx:if="{{advanced}}" class="advanced">
+      <text class="label">选择同伴</text>
+      <view class="buddies">
+        <text class="buddy {{item.checked ? 'selected' : ''}}" wx:for="{{buddies}}" wx:key="index" bindtap="toggleBuddy" data-index="{{index}}">{{item.name}}</text>
+      </view>
+      <text class="label">联系电话</text>
+      <input class="input" type="number" maxlength="11" value="{{phone}}" placeholder="场馆未自动带出时使用" placeholder-class="placeholder" bindinput="onPhone" />
+      <view class="two">
+        <view><text class="label">单笔金额上限</text><view class="input amount-input"><text class="currency">¥</text><input type="digit" value="{{maxAmount}}" bindinput="onAmount" /></view></view>
+        <view><text class="label">登录核验间隔</text><picker range="{{keepAliveLabels}}" value="{{keepAliveIndex}}" bindchange="onKeepAlive"><view class="picker">{{keepAliveLabels[keepAliveIndex]}}</view></picker></view>
+      </view>
+      <view class="switch-row"><view><text>10秒下单预算</text><text class="hint">高峰期更快提交，超时即停止</text></view><switch checked="{{fast}}" color="#1a6851" bindchange="onFast" /></view>
+      <view class="switch-row"><view><text>复用学校登录态</text><text class="hint">失效后自动重新登录</text></view><switch checked="{{remember}}" color="#1a6851" bindchange="onRemember" /></view>
+    </view>
+  </view>
+
+  <text class="error form-error">{{formError}}</text>
+  <view class="footer"><text>COURTSIDE · BUAA</text><text>留点时间，去打球。</text></view>
+</view>
+
+<view class="action-bar">
+  <text wx:if="{{mode !== 'daily' && blocked}}" class="action-note">已有任务运行或待核对，请先处理当前任务。</text>
+  <view class="action-buttons">
+    <button class="secondary save" bindtap="onSave" disabled="{{busy || !ready || !jobsReady}}">保存</button>
+    <button class="primary submit" bindtap="onSubmit" loading="{{busy}}" disabled="{{busy || !ready || !jobsReady || (mode !== 'daily' && blocked)}}">{{submitText}}</button>
+  </view>
+</view>
