@@ -13,9 +13,10 @@ import time
 from urllib.parse import urlencode, urlparse
 
 from playwright.sync_api import Error as BrowserError, sync_playwright
-from cgyy import BASE_URL, CHINA, DEFAULT_CONFIG, LOG, ReservationError, SubmissionRejected, TaskStopped, VenueClient, authenticated_client, available_choice, load_config, sleep_until, target_date
+from cgyy import BASE_URL, CHINA, DEFAULT_CONFIG, LOG, ReservationError, SubmissionRejected, TaskStopped, VenueClient, authenticated_client, available_choice, load_config, load_venue_tabs, open_venue_tabs, sleep_until, target_date
 from login_state import DEFAULT_SESSION_STATE, LoginState
 from payment import CampusQRCode, ExpectedOrder, PaymentError, amount
+import notify
 from text_captcha import CaptchaError, TextCaptchaSolver
 
 
@@ -43,7 +44,7 @@ def daily_config(config: dict, now: datetime | None = None) -> dict:
 
 
 class BookingJob:
-    def __init__(self, config: dict, state_path: Path, *, payment_qr=False, fast=False, captcha_solver=None, login_state=None, poll_availability=True):
+    def __init__(self, config: dict, state_path: Path, *, payment_qr=False, fast=False, captcha_solver=None, login_state=None, poll_availability=True, session=None):
         self.config = config
         self.state_path = state_path
         self.desired = target_date(config)
@@ -58,7 +59,13 @@ class BookingJob:
         self.read_failures = 0
         self.fast = fast
         self.captcha_solver = captcha_solver
-        self.prepared_venue = None
+        # 每个场馆一个标签页；prepared 是已打开到目标日期的场馆，fresh 是开放后才加载、无需再刷新的场馆。
+        self.session = session
+        self.clients = {}
+        self.prepared = set()
+        self.fresh = set()
+        self.refreshing = {}
+        self.notified = set()
         self.login_state = login_state if login_state is not None else LoginState()
         self.keep_alive_seconds = int(config.get('keep_alive_seconds', 300))
         if self.keep_alive_seconds < 30:
@@ -71,22 +78,34 @@ class BookingJob:
 
     def status(self, status: str, **details) -> None:
         previous = json.loads(self.state_path.read_text()) if self.state_path.exists() else {}
-        value = dict(previous, status=status, updated_at=datetime.now(CHINA).isoformat(), **details)
+        now=datetime.now(CHINA).isoformat()
+        value = dict(previous, status=status, updated_at=now, **details)
+        value.setdefault('started_at', now)  # 整个任务的起点，前端用来显示总耗时。
+        if previous.get('status')!=status or ('phase' in details and details['phase']!=previous.get('phase')):
+            value['phase_started_at']=now
         self.state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         temporary = self.state_path.with_suffix('.tmp')
         temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
         temporary.chmod(0o600)
         temporary.replace(self.state_path)
         LOG.info('任务状态：%s', status)
+        message = notify.booking_message(value)
+        if message and message[0] not in self.notified:
+            self.notified.add(message[0])
+            notify.send(*message[1:4], urgent=message[4])
 
-    def scan(self, client: VenueClient) -> bool:
+    def scan(self, base: VenueClient) -> bool:
         started = time.monotonic()
-        deadline = started + (10 if self.fast else 20)
+        # Initial page loading is preparation; reserve the fast budget for
+        # reading current availability, selecting and submitting an order.
+        deadline = started + 90
+        submission_seconds = 10 if self.fast and self.poll_availability else 45
         period = f"{self.config['reserve_time'][0]:02}:00–{self.config['reserve_time'][-1]+1:02}:00"
         for venue in self.config['venues']:
             self.check_cancelled()
             if self.submission_started:
                 raise ReservationError('已经尝试过提交，停止以免重复下单。')
+            client = self.clients.get(venue, base)
             client.config = dict(self.config, venue=venue)
             self.status('checking', venue=venue, phase='open_venue', message=f'正在加载{venue}。')
             slots = None
@@ -94,16 +113,26 @@ class BookingJob:
                 phase = 'open_venue'
                 try:
                     with client.reading_until(deadline):
-                        if self.fast and self.prepared_venue == venue:
-                            self.prepared_venue = None
-                            client.refresh_availability()
+                        if self.fast and venue in self.prepared:
+                            self.prepared.discard(venue)
+                            waiter = self.refreshing.pop(venue, None)
+                            if venue in self.fresh:
+                                self.fresh.discard(venue)  # 开放后刚加载，页面就是当前余票。
+                            elif waiter is not None:
+                                self.status('checking', phase='refresh', message=f'正在读取{venue}的当前余票。')
+                                client.finish_refresh(waiter)
+                            else:
+                                self.status('checking', phase='refresh', message=f'正在刷新{venue}的当前余票。')
+                                client.refresh_availability()
                         else:
                             client.open_venue()
                         phase = 'choose_date'
                         self.status('checking', phase=phase, message=f'正在读取{self.desired}的{period}余票。')
                         client.choose_date(self.desired)
                         phase = 'inspect'
-                        slots = client.find_choice() if self.fast else client.inspect()
+                        booking_started = time.monotonic()
+                        with client.reading_until(booking_started + (submission_seconds if self.fast else 20)):
+                            slots = client.find_choice() if self.fast else client.inspect()
                     break
                 except ReservationError as error:
                     LOG.info('%s：%s', venue, error)
@@ -134,18 +163,20 @@ class BookingJob:
             if not chosen:
                 LOG.info('%s 无满足 %s 的连续场地。', venue, period)
                 continue
-            if self.fast and time.monotonic() - started >= 10:
+            if self.fast and time.monotonic() - booking_started >= submission_seconds:
                 raise ReservationError('本轮查场已超过10秒预算，未提交订单。')
             expected = None
             if self.payment_qr:
                 expected = ExpectedOrder.from_choice('',venue,self.desired,chosen,amount(self.config.get('max_pay_amount','70.00')))
             self.check_cancelled()
             self.submission_started = True
-            self.status('submitting', venue=venue, court=chosen[0]['court'])
+            self.status('submitting', venue=venue, court=chosen[0]['court'], phase='submit',
+                        message='场地已选定，正在完成学校验证码并等待订单确认。')
             try:
                 if self.fast or self.captcha_solver:
-                    timeout = max(1, int((10 - (time.monotonic() - started)) * 1000)) if self.fast else 45000
-                    data = client.submit(chosen, timeout=timeout, captcha_solver=self.captcha_solver)
+                    timeout = max(1, int((submission_seconds - (time.monotonic() - booking_started)) * 1000)) if self.fast else 45000
+                    data = client.submit(chosen, timeout=timeout, captcha_solver=self.captcha_solver,
+                                         progress=lambda phase, message: self.status('submitting', phase=phase, message=message))
                 else:
                     data = client.submit(chosen)
             except SubmissionRejected as error:
@@ -164,13 +195,19 @@ class BookingJob:
             self.status('locked', venue=venue, court=chosen[0]['court'], trade_no=data['tradeNo'],
                         date=str(self.desired), slots=[(cell['court'],cell['start'],cell['end']) for cell in chosen],
                         payment_url=payment_url, booking_elapsed_seconds=round(time.monotonic() - started, 3),
-                        message='订单已生成，请本人尽快登录网站，在页面倒计时内付款。')
+                        amount=str(expected.fee) if expected else None, phase='payment_qr',
+                        message='订单已生成，正在获取官方付款入口。')
             if expected is not None:
                 from dataclasses import replace
                 payer = CampusQRCode(client.page,replace(expected,trade_no=data['tradeNo']))
                 try:
-                    qr = payer.create()
-                    self.status('awaiting_payment', **qr, message=qr.get('scan_tip','请在倒计时内扫描官方二维码付款。'))
+                    qr = payer.create(progress=lambda phase, message: self.status('locked', phase=phase, message=message),
+                                      update=lambda entry:self.status('awaiting_payment',**entry,
+                        phase='alipay_qr',message='校园付入口已就绪，正在获取支付宝交易码；可先打开官方收银台。'))
+                    if qr.pop('payment_confirmed',False):
+                        self.status('paid',message='场馆已确认付款成功，预约有效。',qr_code=None)
+                        return True
+                    self.status('awaiting_payment', **qr, phase='payment_ready',message=qr.get('scan_tip','请在倒计时内扫描官方二维码付款。'))
                     payer.wait_for_payment(qr['expires_at'], self.status)
                 except (PaymentError,BrowserError) as error:
                     self.status('qr_needs_attention',message=str(error) if isinstance(error,PaymentError) else '订单已生成，二维码或支付状态读取失败，请到场馆网站核对，不重复下单。',qr_code=None)
@@ -186,8 +223,73 @@ class BookingJob:
 
     def login(self, browser, user: str, password: str):
         self.status('logging_in')
+        if self.session is not None:
+            return self.session.acquire(user, password, config=self.config, login_state=self.login_state,
+                                        progress=lambda message:self.status('logging_in',message=message))
         return authenticated_client(browser, self.config, user, lambda:password, self.login_state,
-                                    ignore_password_warning=True)
+                                    ignore_password_warning=True,
+                                    progress=lambda message:self.status('logging_in',message=message))
+
+    def prepare_all(self, base: VenueClient, *, fresh: bool = False) -> None:
+        """每个场馆一个标签页并同时加载，主馆无空场时副馆已经就绪。
+        常驻会话已预先打开预约页时直接接管，只切换日期；余票在查询前统一刷新。"""
+        self.close_tabs(base)
+        venues = self.config['venues']
+        progress = lambda phase, message: self.status('checking', phase=phase, message=message)
+        warm = self.session.take_tabs(venues) if self.session is not None else {}
+        if warm and next(iter(warm.values())) is base:
+            self.clients = warm
+            self.prepared = load_venue_tabs(warm, self.config, self.desired, reopen=False, progress=progress)
+            # 预热的页面是之前加载的，不能当作当前余票。
+            self.fresh = set()
+            self.refreshing = {}
+            if fresh:
+                self.status('checking', phase='refresh', message='正在同时刷新所有场馆的当前余票。')
+                self.begin_refreshes()
+        else:
+            if warm:
+                self.session.keep_tabs({})
+            self.clients, self.prepared = open_venue_tabs(base, self.config, self.desired, progress=progress)
+            self.fresh = set(self.prepared) if fresh else set()
+            self.refreshing = {}
+        names = list(self.clients)
+        self.status('ready', venue=next((v for v in names if v in self.prepared), None),
+                    prepared_venues=[v for v in names if v in self.prepared], release_at=self.release.isoformat(),
+                    message='场馆页面已就绪。')
+
+    def begin_refreshes(self) -> None:
+        """开放时刻同时触发所有已准备场馆的余票刷新，逐个检查时不再等待各自的请求。"""
+        for venue in self.config['venues']:
+            client = self.clients.get(venue)
+            if (client is None or venue not in self.prepared or venue in self.fresh
+                    or venue in self.refreshing):
+                continue
+            try:
+                with client.reading_until(time.monotonic() + 30):
+                    self.refreshing[venue] = client.begin_refresh()
+            except (ReservationError, BrowserError):
+                self.prepared.discard(venue)
+
+    def release_tabs(self, base) -> None:
+        """任务结束：常驻会话收回标签页供下次复用；独立进程直接关闭。"""
+        if self.session is not None:
+            for waiter in self.refreshing.values():
+                waiter.cancel()
+            self.session.keep_tabs(self.clients)
+            self.clients, self.prepared, self.fresh, self.refreshing = {}, set(), set(), {}
+        else:
+            self.close_tabs(base)
+
+    def close_tabs(self, base=None) -> None:
+        for waiter in self.refreshing.values():
+            waiter.cancel()
+        for client in self.clients.values():
+            if base is None or client.page is not base.page:
+                try:
+                    client.page.close()
+                except BrowserError:
+                    pass
+        self.clients, self.prepared, self.fresh, self.refreshing = {}, set(), set(), {}
 
     def check_cancelled(self):
         if (self.state_path.parent/'cancel.request').exists():
@@ -203,9 +305,12 @@ class BookingJob:
                 self.login_state.save(context, user)
                 self.status('session_valid', checked_at=datetime.now(CHINA).isoformat())
             else:
-                context.close()
+                self.close_tabs(client)
+                if self.session is not None:
+                    self.session.mark_invalid()
+                else:
+                    context.close()
                 context, client = self.login(browser, user, password)
-                self.prepared_venue = None
         return context, client
 
     def run(self, browser, user: str, password: str) -> int:
@@ -222,21 +327,22 @@ class BookingJob:
                 self.status('waiting_release', release_at=self.release.isoformat())
                 context, client = self.keep_session_until(browser, context, client, user, password,
                                                          self.release - timedelta(minutes=5))
+                immediate = not self.poll_availability
                 if self.fast:
-                    client.config = dict(self.config, venue=self.config['venues'][0])
-                    client.prepare_booking(self.desired)
-                    self.prepared_venue = self.config['venues'][0]
-                    self.status('ready', venue=self.prepared_venue, release_at=self.release.isoformat())
+                    self.prepare_all(client, fresh=immediate)
                 else:
                     client.list_venues()
                 # 最后15秒前再检查；检查过程不离开已准备的场馆页面。
                 context, client = self.keep_session_until(browser, context, client, user, password,
                                                          self.release - timedelta(seconds=15))
-                if self.fast and self.prepared_venue is None:
-                    client.config = dict(self.config, venue=self.config['venues'][0])
-                    client.prepare_booking(self.desired)
-                    self.prepared_venue = self.config['venues'][0]
+                if self.fast and not self.prepared:
+                    self.prepare_all(client, fresh=immediate)
                 sleep_until(self.release,self.check_cancelled)
+                if self.fast:
+                    self.begin_refreshes()
+            elif self.fast:
+                # 已过开放时间（立即预约或晚启动）：同时加载所有场馆，页面就是当前余票。
+                self.prepare_all(client, fresh=True)
             while datetime.now(CHINA) < self.stop:
                 if self.scan(client):
                     return 0
@@ -252,7 +358,9 @@ class BookingJob:
                         message='没有完成有效查询，不能据此判断场地是否已满。')
             return 1
         finally:
-            context.close()
+            self.release_tabs(client)
+            if self.session is None:
+                context.close()
 
 
 def main(argv=None):

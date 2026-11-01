@@ -146,7 +146,7 @@
         <view><text class="label">单笔金额上限</text><view class="input amount-input"><text class="currency">¥</text><input type="digit" value="{{maxAmount}}" bindinput="onAmount" /></view></view>
         <view><text class="label">登录核验间隔</text><picker range="{{keepAliveLabels}}" value="{{keepAliveIndex}}" bindchange="onKeepAlive"><view class="picker">{{keepAliveLabels[keepAliveIndex]}}</view></picker></view>
       </view>
-      <view class="switch-row"><view><text>10秒下单预算</text><text class="hint">高峰期更快提交，超时即停止</text></view><switch checked="{{fast}}" color="#1a6851" bindchange="onFast" /></view>
+      <view class="switch-row"><view><text>快速查找场地</text><text class="hint">定时任务10秒；立即预约等待上限45秒</text></view><switch checked="{{fast}}" color="#1a6851" bindchange="onFast" /></view>
       <view class="switch-row"><view><text>复用学校登录态</text><text class="hint">失效后自动重新登录</text></view><switch checked="{{remember}}" color="#1a6851" bindchange="onRemember" /></view>
     </view>
   </view>

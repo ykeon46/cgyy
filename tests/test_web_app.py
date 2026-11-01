@@ -8,11 +8,15 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from urllib.request import Request, urlopen
+from urllib.request import Request, ProxyHandler, build_opener
 from urllib.error import HTTPError
 
 import web_app
 from playwright.sync_api import sync_playwright
+
+# Local test traffic must bypass any system HTTP proxy, including requests
+# with a forwarded Host header that differs from the connection address.
+urlopen = build_opener(ProxyHandler({})).open
 
 
 class WebTests(unittest.TestCase):
@@ -92,6 +96,27 @@ class WebTests(unittest.TestCase):
             web_app.apply_schedule(config,True)
             timer=(Path(directory)/'.config/systemd/user/cgyy-daily.timer').read_text()
             self.assertIn('06:25:00 Asia/Shanghai',timer)
+    def test_config_load_and_save_without_systemd(self):
+        web_app.SESSIONS['test-token']={'username':'account-a','buddies':[]}
+        with patch('web_app.subprocess.run',side_effect=FileNotFoundError('systemctl')):
+            result=self.request('/api/config')
+            self.assertFalse(result['daily_enabled'])
+            self.assertIn('reserve_time',result['config'])
+            self.assertTrue(self.request('/api/config',{'config':{},'daily_enabled':False})['ok'])
+            self.assertTrue(web_app.CONFIG.is_file())
+
+    def test_enable_daily_without_systemd_returns_clear_error(self):
+        web_app.SESSIONS['test-token']={'username':'account-a','buddies':[]}
+        with patch('web_app.Path.home',return_value=self.root),patch('web_app.subprocess.run',side_effect=FileNotFoundError('systemctl')):
+            with self.assertRaises(HTTPError) as error:
+                self.request('/api/config',{'config':{},'daily_enabled':True})
+            self.assertEqual(error.exception.code,400)
+            self.assertIn('当前系统不支持每日自动预约',json.load(error.exception)['error'])
+
+    def test_account_switch_without_systemd(self):
+        with patch('web_app.subprocess.run',side_effect=FileNotFoundError('systemctl')):
+            web_app.prepare_account_switch('account-a')
+        self.assertTrue(web_app.account_config_path('account-a').is_file())
     def test_valid_login_sets_http_only_cookie_without_password_response(self):
         with patch('web_app.spawn_worker',return_value={'username':'test-user','buddies':[]}):
             request=Request(self.url+'/api/login',data=json.dumps({'username':'test-user','password':'not-returned'}).encode(),headers={'Content-Type':'application/json','X-CGYY-Client':'1'})
@@ -309,6 +334,40 @@ class BrowserUITests(unittest.TestCase):
         self.assertEqual(self.page.locator('#payment-title').inner_text(),'支付宝付款码')
         self.assertIn('手机支付宝',self.page.locator('#payment-subtitle').inner_text())
         self.assertEqual(self.page.locator('#payment-qr').get_attribute('alt'),'支付宝交易付款二维码')
+
+    def test_payment_entry_updates_to_native_code_without_another_submission(self):
+        self.jobs=[{'id':'progressive-qr','status':'awaiting_payment','trade_no':'test-trade',
+                    'qr_kind':'campus_cashier','expires_at':(datetime.now(web_app.CHINA)+timedelta(seconds=50)).isoformat(),
+                    'qr_code':'data:image/png;base64,aGVsbG8=','updated_at':datetime.now(web_app.CHINA).isoformat()}]
+        self.login()
+        self.page.wait_for_function("()=>document.querySelector('#payment-title').textContent==='校园付收银台入口码'")
+        self.jobs[0].update(qr_kind='alipay_payment',qr_code='data:image/png;base64,bmV3',scan_tip='请使用手机支付宝扫码。')
+        self.page.wait_for_function("()=>document.querySelector('#payment-title').textContent==='支付宝付款码'",timeout=2000)
+        self.assertEqual(self.page.locator('#payment-qr').get_attribute('src'),'data:image/png;base64,bmV3')
+        self.assertFalse(any(path=='jobs' for path,body in self.posts))
+
+    def test_progress_marks_login_and_qr_generation_as_current_steps(self):
+        now=datetime.now(web_app.CHINA).isoformat()
+        self.jobs=[{'id':'progress','status':'logging_in','message':'正在恢复学校登录态。',
+                    'phase_started_at':now,'updated_at':now}]
+        self.login()
+        self.page.locator('#step-login.current').wait_for()
+        self.assertNotIn('current',self.page.locator('#step-book').get_attribute('class') or '')
+        self.jobs[0].update(status='locked',trade_no='test-trade',message='正在获取官方付款入口。')
+        self.page.locator('#step-pay.current').wait_for(timeout=2000)
+        self.assertIn('正在获取',self.page.locator('#step-pay').inner_text())
+        self.assertFalse(self.page.locator('#payment-qr').is_visible())
+
+    def test_pending_payment_remains_visible_when_history_is_selected(self):
+        now=datetime.now(web_app.CHINA)
+        self.jobs=[{'id':'pending','status':'awaiting_payment','trade_no':'current-trade',
+                    'qr_kind':'alipay_payment','expires_at':(now+timedelta(seconds=50)).isoformat(),
+                    'qr_code':'data:image/png;base64,aGVsbG8=','updated_at':now.isoformat()},
+                   {'id':'history','status':'expired','updated_at':now.isoformat()}]
+        self.login();self.page.locator('#nav-history').click()
+        self.page.locator('#history-list button').nth(1).click()
+        self.assertTrue(self.page.locator('#payment-qr').is_visible())
+        self.assertEqual(self.page.locator('#payment-title').inner_text(),'支付宝付款码')
 
 
 if __name__=='__main__':unittest.main()

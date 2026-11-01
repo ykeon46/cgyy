@@ -12,7 +12,7 @@ import yaml
 from playwright.sync_api import sync_playwright
 from playwright.sync_api import TimeoutError as BrowserTimeout
 
-from cgyy import DEFAULT_CONFIG, ReservationError, SubmissionRejected, VenueClient, available_choice, load_config, target_date
+from cgyy import DEFAULT_CONFIG, ReservationError, SubmissionRejected, VenueClient, available_choice, load_config, prepare_venues, target_date
 
 # 使用当前网页实际的类名和接口前缀，场地顺序故意与编号相反。
 HTML = '''<!doctype html><html><head><meta charset="utf-8"></head><body>
@@ -35,6 +35,68 @@ document.querySelectorAll('.date_box > div').forEach(d=>d.onclick=async()=>{
 });
 document.querySelector('.btn').onclick=()=>fetch('/venue-server/api/reservation/order/submit',{method:'POST'});
 </script></body></html>'''
+
+
+# 场馆列表与预约页：点“订场”和切换日期都要等待一次慢请求，用来验证多个标签页的等待能重叠。
+SLOW_SITE = '''<!doctype html><html><head><meta charset="utf-8"></head><body>
+<div class="place-item"><h5>学院路校区-体育馆主馆-羽毛球</h5><span class="book">订场</span></div>
+<div class="place-item"><h5>学院路校区-体育馆训练馆(副馆)-羽毛球</h5><span class="book">订场</span></div>
+<script>
+const slow = () => fetch('/venue-server/api/slow').then(() => new Promise(done => setTimeout(done, 700)));
+document.querySelectorAll('.book').forEach(button => button.onclick = async () => {
+  history.pushState({}, '', '/venue/venue-reservation/1');
+  await slow();
+  document.body.innerHTML = '<div class="reservationStep1"><div class="date_box"><div class="active"><span>10月19日</span></div>' +
+    '<div><span>10月20日</span></div></div><div id="scrollTable"><table><thead><tr><td>场地</td><td>20:00-21:00</td></tr></thead>' +
+    '<tbody><tr><td>1号</td><td><div class="reserveBlock free">￥15.00</div></td></tr></tbody></table></div></div>';
+  document.querySelectorAll('.date_box > div').forEach(day => day.onclick = async () => {
+    await fetch('/venue-server/api/reservation/day/info'); await new Promise(done => setTimeout(done, 700));
+    document.querySelectorAll('.date_box > div').forEach(other => other.classList.remove('active')); day.classList.add('active');
+  });
+});
+</script></body></html>'''
+
+
+class ParallelPreparationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.playwright = sync_playwright().start()
+        cls.browser = cls.playwright.chromium.launch(headless=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.browser.close()
+        cls.playwright.stop()
+
+    def test_two_venue_tabs_load_at_the_same_time(self):
+        context = self.browser.new_context()
+        self.addCleanup(context.close)
+        context.route('**/*', lambda route: route.fulfill(json={'code': 200}) if '/api/' in route.request.url
+                      else route.fulfill(content_type='text/html', body=SLOW_SITE))
+        config = dict(load_config(DEFAULT_CONFIG), candidates=[])
+        first = VenueClient(context.new_page(), dict(config, venue='学院路校区-体育馆主馆-羽毛球'))
+        first.page.goto('https://cgyy.buaa.edu.cn/venue/venue-introduce')
+        second = VenueClient(context.new_page(), dict(config, venue='学院路校区-体育馆训练馆(副馆)-羽毛球'))
+        started = time.monotonic()
+        second.start_navigation('https://cgyy.buaa.edu.cn/venue/venue-introduce')
+        self.assertEqual(prepare_venues([first, second], date(2026, 10, 20)), [True, True])
+        elapsed = time.monotonic() - started
+        for client in (first, second):
+            self.assertIn('10月20日', client.page.locator('.date_box .active').inner_text())
+        # 每个标签页依次等待约1.4秒；逐个加载需要约2.8秒。
+        self.assertLess(elapsed, 2.3)
+
+    def test_failed_tab_does_not_block_the_other_venue(self):
+        context = self.browser.new_context()
+        self.addCleanup(context.close)
+        context.route('**/*', lambda route: route.fulfill(json={'code': 200}) if '/api/' in route.request.url
+                      else route.fulfill(content_type='text/html', body=SLOW_SITE))
+        config = dict(load_config(DEFAULT_CONFIG), candidates=[])
+        good = VenueClient(context.new_page(), dict(config, venue='学院路校区-体育馆主馆-羽毛球'))
+        good.page.goto('https://cgyy.buaa.edu.cn/venue/venue-introduce')
+        missing = VenueClient(context.new_page(), dict(config, venue='不存在的场馆'))
+        missing.page.goto('https://cgyy.buaa.edu.cn/venue/venue-introduce')
+        self.assertEqual(prepare_venues([good, missing], date(2026, 10, 20), raise_errors=False), [True, False])
 
 
 class ConfigTests(unittest.TestCase):
@@ -173,6 +235,12 @@ class BrowserTests(unittest.TestCase):
         with self.client.reading_until(time.monotonic()+1):
             self.assertEqual(self.client.list_venues(),['测试场馆'])
         for route in pending:route.abort()
+
+    def test_date_with_zero_padded_day_can_be_selected(self):
+        self.page.locator('.date_box > div').nth(1).locator('span').evaluate(
+            "element => element.textContent='10月02日'")
+        self.client.choose_date(date(2026,10,2))
+        self.assertIn('10月02日',self.page.locator('.date_box .active').inner_text())
 
     def test_date_change_waits_for_actual_api_prefix(self):
         self.client.choose_date(date(2026,10,20))

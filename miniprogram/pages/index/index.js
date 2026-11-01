@@ -44,7 +44,7 @@ Page({
     this.setData({ready: false, jobsReady: false});
     this.load().catch(error => this.handleError(error));
     this.refreshJobs();
-    this.poll = setInterval(() => this.refreshJobs(), 1500);
+    this.poll = setInterval(() => this.refreshJobs(), 500);
     this.tick = setInterval(() => this.updateCountdown(), 500);
   },
 
@@ -273,7 +273,7 @@ Page({
       title: paid ? '预约已确认' : pending ? (alipay ? '支付宝付款码' : '校园付收银台入口码') : LABELS[status] || '预约任务',
       subtitle: paid ? '场馆已确认支付成功，准备上场吧' : pending ? (job.scan_tip || '校园付收银台入口，扫码后按官方页面操作，可能需要登录。') : RUNNING.includes(status) ? '订单生成后，付款码会显示在这里。' : (job.date ? job.date + ' · ' + venueName(job.venue) : ''),
       placeholder: paid ? '预约完成' : status === 'expired' ? '付款码已过期' : '先选场，再扫码',
-      message: job.message || LABELS[status] || '等待场馆响应',
+      message: (job.message || LABELS[status] || '等待场馆响应') + this.progressNote(job),
       alipayUrl: alipay && /^https:\/\/qr\.alipay\.com\//.test(job.alipay_url || '') ? job.alipay_url : '',
       cashierUrl: /^https:\/\/cashier\.cc-pay\.cn\//.test(job.cashier_url || '') ? job.cashier_url : '',
       hasOrder: !!job.trade_no,
@@ -285,9 +285,9 @@ Page({
         ['应付金额', job.amount ? '¥ ' + Number(job.amount).toFixed(2) : '以官方订单为准']
       ].map(([k, v]) => ({k, v})) : [],
       steps: [
-        {text: '学校账号已登录', state: 'done'},
-        {text: job.trade_no ? '预约订单已生成' : LABELS[status] || '等待预约场次', state: job.trade_no ? 'done' : RUNNING.includes(status) ? 'current' : ''},
-        {text: pending ? '请扫码完成付款' : paid ? '支付已确认' : '获取付款二维码', state: paid ? 'done' : pending ? 'current' : ''},
+        {text: ['queued', 'waiting_start', 'logging_in'].includes(status) ? LABELS[status] : '学校账号已登录', state: ['queued', 'waiting_start', 'logging_in'].includes(status) ? 'current' : 'done'},
+        {text: job.trade_no ? '预约订单已生成' : LABELS[status] || '等待预约场次', state: job.trade_no ? 'done' : RUNNING.includes(status) && !['queued', 'waiting_start', 'logging_in'].includes(status) ? 'current' : ''},
+        {text: pending ? '请扫码完成付款' : paid ? '支付已确认' : status === 'locked' ? '正在获取官方付款码' : '获取付款二维码', state: paid ? 'done' : pending || status === 'locked' ? 'current' : ''},
         {text: paid ? '预约有效，准备上场' : '核对预约结果', state: paid ? 'done' : ''}
       ].map((step, k) => Object.assign({k}, step)),
       cancellable: RUNNING.includes(status) && !['submitting', 'locked', 'awaiting_payment'].includes(status),
@@ -310,8 +310,22 @@ Page({
     this.updateCountdown();
   },
 
+  // 运行中的任务显示本步和总共已等待的秒数，让慢步骤一目了然。
+  progressNote(job) {
+    if (!job || !RUNNING.includes(job.status) || job.status === 'awaiting_payment') return '';
+    const now = Date.now() + this.serverOffset;
+    const step = Math.floor((now - api.parseTime(job.phase_started_at || job.updated_at)) / 1000);
+    const total = Math.floor((now - api.parseTime(job.started_at)) / 1000);
+    if (!Number.isFinite(step) || step < 0) return '';
+    return '（本步' + step + '秒' + (Number.isFinite(total) && total > step ? ' · 共' + total + '秒' : '') + '）';
+  },
+
   updateCountdown() {
     const job = this.currentJob();
+    if (job && this.data.pay && this.data.pay.id === job.id && RUNNING.includes(job.status) && job.status !== 'awaiting_payment') {
+      const message = (job.message || LABELS[job.status] || '等待场馆响应') + this.progressNote(job);
+      if (message !== this.data.pay.message) this.setData({'pay.message': message});
+    }
     if (!job || job.status !== 'awaiting_payment') return;
     const remaining = Math.max(0, Math.ceil((api.parseTime(job.expires_at) - Date.now() - this.serverOffset) / 1000));
     const update = {
