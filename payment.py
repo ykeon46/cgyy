@@ -81,7 +81,7 @@ class ExpectedOrder:
 READ_ORDER = r'''tradeNo => new Promise(resolve => {
     const node = Array.from(document.querySelectorAll('*')).find(e => e.__vue__ && e.__vue__.commonMethods);
     if (!node) return resolve({error:true});
-    const timer = setTimeout(() => resolve({error:true}), 6000);
+    const timer = setTimeout(() => resolve({error:true}), 15000);
     node.__vue__.commonMethods.emitAjax({
         path:'/api/venue/finances/order/detail', data:{venueTradeNo:tradeNo},
         success:data=>{clearTimeout(timer);resolve({data});},
@@ -90,12 +90,44 @@ READ_ORDER = r'''tradeNo => new Promise(resolve => {
 })'''
 
 
+# 发起订单查询后立即返回，结果存进页面变量；用于在加载收银台的同时完成最后一次订单核对。
+START_ORDER_CHECK = r'''([tradeNo, key]) => {
+    window[key] = null;
+    const node = Array.from(document.querySelectorAll('*')).find(e => e.__vue__ && e.__vue__.commonMethods);
+    if (!node) { window[key] = {error:true}; return; }
+    const timer = setTimeout(() => { window[key] = window[key] || {error:true}; }, 8000);
+    node.__vue__.commonMethods.emitAjax({
+        path:'/api/venue/finances/order/detail', data:{venueTradeNo:tradeNo},
+        success:data => { clearTimeout(timer); window[key] = {data}; },
+        error:() => { clearTimeout(timer); window[key] = {error:true}; }
+    });
+}'''
+
+
 class CampusQRCode:
     def __init__(self, page, expected: ExpectedOrder, *, direct=True):
         self.page = page
         self.expected = expected
         self.requested = False
         self.direct = direct
+        self.checks = 0
+
+    def start_order_check(self) -> str:
+        self.checks += 1
+        key = f'__cgyyOrderCheck{self.checks}'
+        if urlparse(self.page.url).hostname != 'cgyy.buaa.edu.cn':
+            raise PaymentError('场馆页面域名异常。')
+        self.page.evaluate(START_ORDER_CHECK, [self.expected.trade_no, key])
+        return key
+
+    def finish_order_check(self, key: str) -> dict:
+        try:
+            result = self.page.wait_for_function('key => window[key]', arg=key, timeout=10000).json_value()
+        except BrowserError:
+            result = None
+        if not isinstance(result, dict) or not isinstance(result.get('data'), dict):
+            raise PaymentError('读取场馆订单状态失败，请核对预约记录。')
+        return result['data']
 
     def alipay_qr(self, cashier_url, expires_at):
         """Read the official transaction QR; never open or submit account/password forms."""
@@ -105,6 +137,10 @@ class CampusQRCode:
             remaining = int((deadline-time.monotonic())*1000)
             if remaining<=0:raise PaymentError('获取支付宝交易码超时。')
             return remaining
+        # 最后一次订单核对与收银台加载同时进行，省去一次排在最后的等待；
+        # 付款码展示后仍每秒核对订单，已付款或取消会立即撤下付款码。
+        started = time.monotonic()
+        check = self.start_order_check()
         cashier = self.page.context.new_page()
         try:
             cashier.goto(cashier_url,wait_until='domcontentloaded',timeout=timeout())
@@ -131,7 +167,14 @@ class CampusQRCode:
             import qrcode
             image=qrcode.make(target,box_size=8,border=4)
             output=BytesIO();image.save(output,format='PNG')
-            self.expected.verify(self.read_order())
+            loaded = time.monotonic()
+            latest=self.finish_order_check(check)
+            logging.getLogger('cgyy').info('支付宝交易码：收银台 %.1f 秒，订单核对额外等待 %.1f 秒。',
+                                           loaded-started, time.monotonic()-loaded)
+            if str(latest.get('payStatus'))=='2' and str(latest.get('orderStatus'))=='1':
+                self.expected.verify(latest,payable=False)
+                return None,None
+            self.expected.verify(latest)
             return 'data:image/png;base64,'+base64.b64encode(output.getvalue()).decode(),target
         finally:
             cashier.close()
@@ -144,10 +187,14 @@ class CampusQRCode:
             raise PaymentError('读取场馆订单状态失败，请核对预约记录。')
         return result['data']
 
-    def create(self):
+    def create(self, *, update=None, progress=None):
+        report = progress or (lambda phase, message: None)
         if self.requested:
             raise PaymentError('已请求本订单的二维码，不重复创建支付交易。')
+        report('order_read', '订单已生成，正在核对订单金额和付款时限。')
+        started = time.monotonic()
         data = self.read_order()
+        read_seconds = time.monotonic() - started
         self.expected.verify(data)
         remaining = int(data['remainSecond'])
         expires_at = datetime.now().astimezone() + timedelta(seconds=remaining)
@@ -161,6 +208,7 @@ class CampusQRCode:
             except ValueError:
                 pass
         self.requested = True
+        report('pay_request', '订单核对无误，正在向学校申请付款交易。')
         # 使用场馆网页自己的签名请求封装；参数与官方校园付入口一致。
         response = self.page.evaluate(r'''spec => new Promise(resolve => {
             const node=[...document.querySelectorAll('*')].find(e=>e.__vue__?.commonMethods?.emitAjax && e.__vue__?.config?.payList);
@@ -169,7 +217,7 @@ class CampusQRCode:
             const channel=vm.config.payList.find(item=>String(item.payType)==='13' &&
                 (item.isOpenRole || item.supportRoleList?.includes(vm.userInfo?.role)));
             if (!channel) return resolve({error:'当前账号未开放校园付'});
-            const timer=setTimeout(()=>resolve({error:'二维码请求超时，请核对原订单'}),10000);
+            const timer=setTimeout(()=>resolve({error:'二维码请求超时，请核对原订单'}),spec.timeout);
             vm.commonMethods.emitAjax({path:'/api/venue/finances/order/pay',type:'POST',
                 data:{payType:13,venueTradeNo:spec.tradeNo,paySecret:null,cardNo:null,outTradeNo:null,
                     couponId:null,amtEndDate:spec.amtEndDate||null,isApp:0,payRemark:null,isWeChat:null,
@@ -177,7 +225,9 @@ class CampusQRCode:
                 success:data=>{clearTimeout(timer);resolve({data});},
                 error:()=>{clearTimeout(timer);resolve({error:'官方付款二维码未生成，请核对原订单'});}
             });
-        })''', {'tradeNo':self.expected.trade_no,'amtEndDate':data.get('amtEndDate')})
+        })''', {'tradeNo':self.expected.trade_no,'amtEndDate':data.get('amtEndDate'),
+                # 付款交易请求常需10秒以上；放弃就无法付款，所以一直等到付款窗口结束前5秒。
+                'timeout':max(10000,int((expires_at-datetime.now().astimezone()).total_seconds()-5)*1000)})
         result=response.get('data') if isinstance(response,dict) else None
         if not isinstance(result,dict):
             raise PaymentError(response.get('error','官方付款二维码未生成，请核对原订单。'))
@@ -197,14 +247,26 @@ class CampusQRCode:
         qr={'qr_code':'data:'+mime+';base64,'+raw,'cashier_url':result['schoolPayUrl'],
             'expires_at':expires_at.isoformat(),'amount':str(self.expected.fee),
             'qr_kind':'campus_cashier','scan_tip':'校园付收银台入口，扫码后按官方页面选择支付方式，可能需要登录。'}
+        # Publish the usable official entry before loading the Alipay page.
+        # A separate snapshot prevents later enrichment changing an earlier event.
+        logging.getLogger('cgyy').info('校园付入口码：读取订单 %.1f 秒，生成交易 %.1f 秒。',
+                                       read_seconds, time.monotonic() - started - read_seconds)
+        if update:
+            update(dict(qr))
         if self.direct:
             try:
                 qr['qr_code'],qr['alipay_url']=self.alipay_qr(result['schoolPayUrl'],expires_at)
+                if qr['qr_code'] is None:
+                    return dict(qr,payment_confirmed=True)
                 qr.update(qr_kind='alipay_payment',scan_tip='请使用已登录的手机支付宝扫码，在手机上确认付款。')
             except (BrowserError,PaymentError,ImportError,ValueError) as error:
                 reason=str(error) if isinstance(error,PaymentError) else type(error).__name__
                 logging.getLogger('cgyy').warning('未获取到已核对的支付宝交易码，返回校园付收银台入口（%s）。',reason)
-                self.expected.verify(self.read_order())
+                latest=self.read_order()
+                if str(latest.get('payStatus'))=='2' and str(latest.get('orderStatus'))=='1':
+                    self.expected.verify(latest,payable=False)
+                    return dict(qr,qr_code=None,payment_confirmed=True)
+                self.expected.verify(latest)
         return qr
 
     def wait_for_payment(self, expires_at: str, update):
@@ -222,4 +284,4 @@ class CampusQRCode:
             if datetime.now().astimezone() >= deadline:
                 update('expired',message='付款窗口已结束，请核对场馆订单及账单。',qr_code=None)
                 return 'expired'
-            self.page.wait_for_timeout(3000)
+            self.page.wait_for_timeout(1000)

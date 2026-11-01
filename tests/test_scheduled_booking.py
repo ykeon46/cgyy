@@ -7,8 +7,8 @@ from unittest.mock import MagicMock, patch
 from playwright.sync_api import TimeoutError as BrowserTimeout
 import sys
 
-if sys.platform != 'linux':
-    raise unittest.SkipTest('Linux systemd 后台预约任务')
+if sys.platform not in {'linux', 'darwin'}:
+    raise unittest.SkipTest('预约任务需要 POSIX 文件锁')
 
 from cgyy import CHINA, DEFAULT_CONFIG, ReservationError, TaskStopped, load_config
 from scheduled_booking import BookingJob, daily_config, main
@@ -18,6 +18,8 @@ from decimal import Decimal
 
 class ScheduledBookingTests(unittest.TestCase):
     def setUp(self):
+        # 测试中不向真实推送地址发送消息。
+        silence = patch('scheduled_booking.notify.send');silence.start();self.addCleanup(silence.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.config = dict(load_config(DEFAULT_CONFIG), reserve_date='2026-10-21', reserve_time=[20,21],
@@ -61,7 +63,7 @@ class ScheduledBookingTests(unittest.TestCase):
 
     def test_fast_scan_refreshes_prepared_venue_and_passes_captcha_budget(self):
         self.job.fast = True
-        self.job.prepared_venue = self.config['venues'][0]
+        self.job.prepared = {self.config['venues'][0]}
         self.job.captcha_solver = object()
         self.client.find_choice.return_value = [dict(slot,classes=['free']) for slot in self.choice]
         self.client.submit.return_value = {'tradeNo':'fast-test-order'}
@@ -77,20 +79,137 @@ class ScheduledBookingTests(unittest.TestCase):
         self.assertEqual(state['status'], 'locked')
         self.assertIn('booking_elapsed_seconds', state)
 
+    def test_slow_initial_page_does_not_exhaust_fast_submission_budget(self):
+        self.job.fast = True
+        elapsed = [0.0]
+        self.client.open_venue.side_effect = lambda: elapsed.__setitem__(0, 20.0)
+        self.client.choose_date.side_effect = lambda date: elapsed.__setitem__(0, 25.0)
+        self.client.find_choice.side_effect = lambda: (
+            elapsed.__setitem__(0, 26.0) or [dict(slot, classes=['free']) for slot in self.choice])
+        self.client.submit.return_value = {'tradeNo':'test-order'}
+        with patch('scheduled_booking.time.monotonic', side_effect=lambda: elapsed[0]):
+            self.assertTrue(self.job.scan(self.client))
+        self.assertEqual(self.client.submit.call_args.kwargs['timeout'], 9000)
+
+    def test_immediate_fast_scan_leaves_time_for_school_captcha_response(self):
+        self.job.fast = True
+        self.job.poll_availability = False
+        self.client.find_choice.return_value = [dict(slot,classes=['free']) for slot in self.choice]
+        self.client.submit.return_value = {'tradeNo':'test-order'}
+        self.assertTrue(self.job.scan(self.client))
+        timeout = self.client.submit.call_args.kwargs['timeout']
+        self.assertGreater(timeout, 40000)
+        self.assertLessEqual(timeout, 45000)
+
     def test_fast_job_prepares_and_waits_before_its_first_scan(self):
         self.job.fast = True
         context = MagicMock()
         with patch.object(self.job,'login',return_value=(context,self.client)) as login, \
                 patch.object(self.job,'keep_session_until',return_value=(context,self.client)) as keep, \
                 patch.object(self.job,'scan',return_value=True) as scan, \
+                patch.object(self.job,'prepare_all',side_effect=lambda client,fresh:self.job.prepared.add('x')) as prepare, \
+                patch.object(self.job,'begin_refreshes') as refresh, \
                 patch('scheduled_booking.sleep_until') as wait, patch('scheduled_booking.datetime') as clock:
             clock.now.return_value=datetime(2026,10,19,6,tzinfo=CHINA)
             self.assertEqual(self.job.run(MagicMock(),'test-user','test-password'),0)
         login.assert_called_once()
         scan.assert_called_once_with(self.client)
-        self.client.prepare_booking.assert_called_once_with(self.job.desired)
+        prepare.assert_called_once_with(self.client,fresh=False)
+        refresh.assert_called_once()
         self.assertEqual(keep.call_count,2)
         self.assertEqual(wait.call_args.args[0],self.job.release)
+
+    def test_job_after_release_prepares_all_venues_without_extra_refresh(self):
+        self.job.fast=True
+        self.job.poll_availability=False
+        context=MagicMock()
+        with patch.object(self.job,'login',return_value=(context,self.client)), \
+                patch.object(self.job,'prepare_all') as prepare, \
+                patch.object(self.job,'scan',return_value=True), \
+                patch('scheduled_booking.sleep_until'),patch('scheduled_booking.datetime') as clock:
+            clock.now.return_value=datetime(2026,10,19,7,1,tzinfo=CHINA)
+            self.assertEqual(self.job.run(MagicMock(),'test-user','test-password'),0)
+        prepare.assert_called_once_with(self.client,fresh=True)
+        context.close.assert_called_once()
+
+    def test_fresh_tabs_are_read_directly_and_second_venue_uses_its_own_tab(self):
+        self.job.fast=True
+        second=MagicMock()
+        venues=self.config['venues']
+        self.job.clients={venues[0]:self.client,venues[1]:second}
+        self.job.prepared=set(venues);self.job.fresh=set(venues)
+        self.client.find_choice.return_value=[]
+        second.find_choice.return_value=[dict(slot,classes=['free']) for slot in self.choice]
+        second.submit.return_value={'tradeNo':'second-tab-order'}
+        with patch('scheduled_booking.available_choice',side_effect=[[],self.choice]):
+            self.assertTrue(self.job.scan(self.client))
+        for tab in (self.client,second):
+            tab.open_venue.assert_not_called()
+            tab.refresh_availability.assert_not_called()
+        self.client.submit.assert_not_called()
+        second.submit.assert_called_once()
+        self.assertEqual(json.loads(self.job.state_path.read_text())['trade_no'],'second-tab-order')
+
+    def test_refresh_started_at_release_is_finished_when_venue_is_checked(self):
+        self.job.fast=True
+        venue=self.config['venues'][0]
+        waiter=MagicMock()
+        self.job.clients={venue:self.client};self.job.prepared={venue}
+        self.client.begin_refresh.return_value=waiter
+        self.job.begin_refreshes()
+        self.client.begin_refresh.assert_called_once()
+        self.client.find_choice.return_value=[dict(slot,classes=['free']) for slot in self.choice]
+        self.client.submit.return_value={'tradeNo':'refreshed-order'}
+        self.assertTrue(self.job.scan(self.client))
+        self.client.finish_refresh.assert_called_once_with(waiter)
+        self.client.refresh_availability.assert_not_called()
+
+    def test_warm_tabs_are_reused_and_refreshed_instead_of_reopened(self):
+        self.job.fast=True
+        second=MagicMock()
+        venues=self.config['venues']
+        session=MagicMock();session.take_tabs.return_value={venues[0]:self.client,venues[1]:second}
+        self.job.session=session
+        with patch('scheduled_booking.load_venue_tabs',return_value=set(venues)) as load, \
+                patch('scheduled_booking.open_venue_tabs') as reopen:
+            self.job.prepare_all(self.client,fresh=True)
+        reopen.assert_not_called()
+        self.assertFalse(load.call_args.kwargs['reopen'])
+        self.assertEqual(self.job.fresh,set())
+        self.client.begin_refresh.assert_called_once();second.begin_refresh.assert_called_once()
+        self.job.begin_refreshes()
+        self.client.begin_refresh.assert_called_once()
+        self.job.release_tabs(self.client)
+        session.keep_tabs.assert_called_once_with({venues[0]:self.client,venues[1]:second})
+        second.page.close.assert_not_called()
+
+    def test_progress_steps_are_recorded_with_separate_phases(self):
+        self.job.fast=True
+        self.client.find_choice.return_value=[dict(slot,classes=['free']) for slot in self.choice]
+        phases=[]
+        def submit(choice,**options):
+            options['progress']('captcha_solve','正在识别并点选验证码。')
+            phases.append(json.loads(self.job.state_path.read_text())['phase'])
+            return {'tradeNo':'progress-order'}
+        self.client.submit.side_effect=submit
+        self.assertTrue(self.job.scan(self.client))
+        self.assertEqual(phases,['captcha_solve'])
+        self.assertIn('started_at',json.loads(self.job.state_path.read_text()))
+
+    def test_shared_session_is_reused_and_never_closed_by_the_job(self):
+        session=MagicMock()
+        context=MagicMock()
+        session.acquire.return_value=(context,self.client)
+        self.job.session=session
+        self.job.poll_availability=False
+        with patch.object(self.job,'scan',return_value=True), \
+                patch('scheduled_booking.authenticated_client') as fresh_login, \
+                patch('scheduled_booking.sleep_until'),patch('scheduled_booking.datetime') as clock:
+            clock.now.return_value=datetime(2026,10,19,7,1,tzinfo=CHINA)
+            self.assertEqual(self.job.run(MagicMock(),'test-user','test-password'),0)
+        session.acquire.assert_called_once()
+        fresh_login.assert_not_called()
+        context.close.assert_not_called()
 
     def test_immediate_job_returns_after_one_scan_without_polling(self):
         self.job.poll_availability=False
@@ -113,7 +232,7 @@ class ScheduledBookingTests(unittest.TestCase):
         self.client.check_session.side_effect=[True,False]
         new_client.check_session.return_value=True
         self.job.login_state=MagicMock()
-        self.job.prepared_venue=self.config['venues'][0]
+        self.job.prepared={self.config['venues'][0]}
         with patch('scheduled_booking.datetime') as clock, \
                 patch('scheduled_booking.sleep_until',side_effect=lambda target,*args:now.__setitem__(0,target)), \
                 patch.object(self.job,'login',return_value=(new_context,new_client)) as login:
@@ -122,7 +241,7 @@ class ScheduledBookingTests(unittest.TestCase):
         self.assertEqual(result,(new_context,new_client))
         login.assert_called_once()
         first_context.close.assert_called_once()
-        self.assertIsNone(self.job.prepared_venue)
+        self.assertEqual(self.job.prepared,set())
         self.assertEqual(self.job.login_state.save.call_count,2)
         self.client.submit.assert_not_called()
         new_client.submit.assert_not_called()

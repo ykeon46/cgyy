@@ -9,6 +9,7 @@ from http.cookies import SimpleCookie
 import json
 import os
 from pathlib import Path
+import queue
 import re
 import secrets
 import shutil
@@ -75,6 +76,7 @@ def prepare_account_switch(previous):
     if not previous:return
     # 先停止未来触发，再更换凭据；未能关闭定时器时保留原账号。
     try:subprocess.run(['systemctl','--user','disable','--now','cgyy-daily.timer'],check=True,capture_output=True)
+    except FileNotFoundError:pass  # 没有 systemd 的平台不存在需要关闭的定时器。
     except (OSError,subprocess.CalledProcessError):raise ValueError('无法关闭每日定时器，暂不能切换账号，请检查部署环境。')
     config=get_config(previous)
     config['account_username']=previous
@@ -151,7 +153,7 @@ def job_states(username=None, limit=30):
     return ordered[:limit]+[state for state in ordered[limit:] if state['status'] in ACTIVE|{'needs_attention','qr_needs_attention'}]
 
 
-def spawn_worker(action,request):
+def worker_command(action):
     env=local_environment()
     private_display=ROOT/'artifacts/runtime/x11/usr/bin/xvfb-run'
     display=str(private_display) if private_display.exists() else shutil.which('xvfb-run')
@@ -161,6 +163,126 @@ def spawn_worker(action,request):
     if runtime.exists():
         env['PATH']=str(runtime/'x11/usr/bin')+os.pathsep+env.get('PATH','')
         env['LD_LIBRARY_PATH']=str(runtime/'x11/usr/lib/x86_64-linux-gnu')+':'+str(runtime/'browser-libs')+':'+env.get('LD_LIBRARY_PATH','')
+    return command,env
+
+
+# 进程退出时仍处于这些阶段的任务，没有提交订单。
+UNSUBMITTED={'queued','logging_in','waiting_start','waiting_release','keeping_session','session_valid','ready','checking','read_retry','waiting_availability'}
+
+
+class WorkerTask:
+    """常驻进程中运行的预约任务，提供与 subprocess.Popen 相同的 poll()。"""
+    def __init__(self,worker,task_id,directory):
+        self.worker=worker;self.id=task_id;self.directory=Path(directory);self.returncode=None
+    def poll(self):
+        if self.returncode is None and not self.worker.alive():self.worker.task_ended(self,1)
+        return self.returncode
+
+
+class SessionWorker:
+    """常驻浏览器进程：保留已登录的学校页面，登录、预约、核对订单都不必重新启动浏览器和恢复登录态。
+    同一时间只处理一个命令；预约任务运行期间的其他请求退回一次性进程。"""
+    def __init__(self):
+        self.process=None;self.lock=threading.Lock();self.replies={};self.task=None
+
+    def alive(self):
+        return self.process is not None and self.process.poll() is None
+
+    def start(self):
+        command,env=worker_command('serve')
+        DATA.mkdir(parents=True,exist_ok=True,mode=0o700)
+        with (DATA/'session-worker.log').open('a') as log:
+            process=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=log,text=True,
+                                     env=env,cwd=ROOT,start_new_session=True,bufsize=1)
+        self.process=process
+        threading.Thread(target=self.read,args=(process,),daemon=True).start()
+
+    def read(self,process):
+        for line in process.stdout:
+            try:message=json.loads(line)
+            except ValueError:continue
+            if message.get('event')=='finished':
+                task=self.task
+                if task and task.id==message.get('task'):self.task_ended(task,0)
+                continue
+            box=self.replies.pop(message.get('id'),None)
+            if box:box.put(message)
+        process.wait()
+        for box in list(self.replies.values()):box.put(None)
+        self.replies.clear()
+        if self.task:self.task_ended(self.task,process.returncode or 1)
+
+    def task_ended(self,task,returncode):
+        if task.returncode is not None:return
+        task.returncode=returncode
+        if self.task is task:self.task=None
+        if returncode:
+            # 进程意外退出：未提交的任务标记失败；已提交的要求核对，避免误判或重复下单。
+            path=task.directory/'status.json'
+            try:state=json.loads(path.read_text())
+            except (OSError,ValueError):return
+            if state.get('status') in UNSUBMITTED:
+                state.update(status='failed',message='浏览器服务意外退出，未提交订单，请重新预约。')
+            elif state.get('status') in ACTIVE:
+                state.update(status='qr_needs_attention' if state.get('trade_no') else 'needs_attention',
+                             message='浏览器服务意外退出，请到场馆网站核对订单，不自动重试。',qr_code=None)
+            else:return
+            state['updated_at']=datetime.now(CHINA).isoformat()
+            write_json(path,state)
+
+    def busy(self):
+        return self.task is not None and self.task.poll() is None
+
+    def send(self,message,timeout):
+        """发送命令并等待回复；进程不可用时返回 None，由调用方退回一次性进程。"""
+        if not self.alive():self.start()
+        box=queue.Queue();self.replies[message['id']]=box
+        try:
+            self.process.stdin.write(json.dumps(message,ensure_ascii=False)+'\n');self.process.stdin.flush()
+        except OSError:
+            self.replies.pop(message['id'],None);return None
+        try:return box.get(timeout=timeout)
+        except queue.Empty:
+            # 卡住的浏览器会阻塞后续命令，结束它；下次请求重新启动。
+            self.replies.pop(message['id'],None);self.process.kill();return None
+
+    def call(self,action,request,timeout=110):
+        with self.lock:
+            if self.busy():return None
+            return self.send(dict(request,op=action,id=uuid.uuid4().hex),timeout)
+
+    def book(self,request):
+        with self.lock:
+            if self.busy():return None
+            task=WorkerTask(self,Path(request['directory']).name,request['directory'])
+            self.task=task
+            # 常驻进程可能正在预热场馆页面，处理完当前命令才会确认。
+            answer=self.send(dict(request,op='book',task=task.id,id=uuid.uuid4().hex),120)
+            if not answer or not answer.get('ok'):
+                if self.task is task:self.task=None
+                task.returncode=1
+                return None
+            return task
+
+
+SESSION_WORKER=SessionWorker()
+
+
+def persistent_browser():
+    return local_environment().get('CGYY_PERSISTENT_BROWSER','1')!='0'
+
+
+def spawn_worker(action,request):
+    if persistent_browser():
+        if action in {'login','recheck'}:
+            answer=SESSION_WORKER.call(action,request)
+            if answer is not None:
+                if not answer.get('ok'):raise ValueError(answer.get('message','登录失败。'))
+                return answer
+        else:
+            task=SESSION_WORKER.book(request)
+            if task is not None:return task
+    command,env=worker_command(action)
     if action in {'login','recheck'}:
         result=subprocess.run(command,input=json.dumps(request),text=True,capture_output=True,env=env,cwd=ROOT,timeout=110)
         try:answer=json.loads(result.stdout.strip().splitlines()[-1])
@@ -175,6 +297,10 @@ def spawn_worker(action,request):
 
 
 def apply_schedule(config,enabled):
+    if not enabled:
+        try:subprocess.run(['systemctl','--user','disable','--now','cgyy-daily.timer'],check=True,capture_output=True)
+        except FileNotFoundError:return
+        return
     units=Path.home()/'.config/systemd/user'
     units.mkdir(parents=True,exist_ok=True)
     timer=(ROOT/'deploy/cgyy-daily.timer').read_text()
@@ -185,7 +311,8 @@ def apply_schedule(config,enabled):
     if not service.exists():
         service.write_text((ROOT/'deploy/cgyy-daily.service.in').read_text().replace('@PROJECT_ROOT@',str(ROOT)))
         service.chmod(0o600)
-    subprocess.run(['systemctl','--user','daemon-reload'],check=True,capture_output=True)
+    try:subprocess.run(['systemctl','--user','daemon-reload'],check=True,capture_output=True)
+    except FileNotFoundError:raise ValueError('当前系统不支持每日自动预约，请在 Linux 服务器配置 systemd 定时器；本机可使用立即预约或指定时间预约。') from None
     subprocess.run(['systemctl','--user',*(['enable','--now'] if enabled else ['disable','--now']),'cgyy-daily.timer'],check=True,capture_output=True)
     if enabled:subprocess.run(['systemctl','--user','restart','cgyy-daily.timer'],check=True,capture_output=True)
 
@@ -253,7 +380,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self.session():self.json({'error':'请先登录学校账号。'},401);return
         if path=='/api/config':
             state=get_config(self.session()['username']);state.pop('sso',None)
-            enabled=subprocess.run(['systemctl','--user','is-enabled','cgyy-daily.timer'],capture_output=True,text=True).returncode==0
+            try:enabled=subprocess.run(['systemctl','--user','is-enabled','cgyy-daily.timer'],capture_output=True,text=True).returncode==0
+            except FileNotFoundError:enabled=False
             self.json({'config':state,'daily_enabled':enabled});return
         if path=='/api/jobs':self.json({'jobs':job_states(self.session()['username']),'server_now':datetime.now(CHINA).isoformat()});return
         self.json({'error':'未找到接口。'},404)
@@ -323,7 +451,8 @@ class Handler(BaseHTTPRequestHandler):
                     task_id=uuid.uuid4().hex
                     directory=DATA/'jobs'/task_id;directory.mkdir(parents=True,mode=0o700)
                     (directory/'config.yaml').write_text(yaml.safe_dump(config,allow_unicode=True))
-                    write_json(directory/'status.json',{'status':'queued','username':session['username'],'updated_at':datetime.now(CHINA).isoformat(),'date':config.get('reserve_date'),'hours':config['reserve_time']})
+                    queued_at=datetime.now(CHINA).isoformat()
+                    write_json(directory/'status.json',{'status':'queued','username':session['username'],'updated_at':queued_at,'started_at':queued_at,'date':config.get('reserve_date'),'hours':config['reserve_time']})
                     PROCESSES[task_id]=spawn_worker('book',{'directory':str(directory),'mode':mode,'run_at':run_at})
                 self.json({'id':task_id});return
             if path=='/api/cancel':

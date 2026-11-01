@@ -12,6 +12,31 @@ LOG = logging.getLogger('cgyy')
 DEFAULT_SESSION_STATE = Path('artifacts/auth/school-session.json')
 SCHOOL_ORIGINS = {'https://cgyy.buaa.edu.cn', 'https://sso.buaa.edu.cn'}
 SCHOOL_COOKIE_DOMAINS = {'buaa.edu.cn', 'cgyy.buaa.edu.cn', 'sso.buaa.edu.cn'}
+_USER_AGENTS = {}
+
+
+def browser_user_agent(browser):
+    """无头 Chromium 的默认标识带 HeadlessChrome，学校网关会让每个请求固定延迟约5秒。
+    按用户要求使用同一浏览器自身的标识，仅去掉 Headless 字样。"""
+    version = getattr(browser, 'version', None)
+    if not isinstance(version, str):
+        return None
+    if version not in _USER_AGENTS:
+        page = browser.new_page()
+        try:
+            agent = page.evaluate('navigator.userAgent')
+        finally:
+            page.close()
+        _USER_AGENTS[version] = agent.replace('HeadlessChrome/', 'Chrome/') if isinstance(agent, str) else None
+    return _USER_AGENTS[version]
+
+
+def context_options(browser) -> dict:
+    options = dict(locale='zh-CN', timezone_id='Asia/Shanghai', viewport={'width':1440,'height':1000})
+    agent = browser_user_agent(browser)
+    if agent:
+        options['user_agent'] = agent
+    return options
 
 
 def school_storage(state: dict) -> dict:
@@ -33,7 +58,7 @@ class LoginState:
         return hashlib.sha256(user.encode('utf-8')).hexdigest()
 
     def new_context(self, browser, user: str, *, restore: bool = True):
-        options = dict(locale='zh-CN', timezone_id='Asia/Shanghai', viewport={'width':1440,'height':1000})
+        options = context_options(browser)
         self.loaded = False
         if restore and self.path and self.path.exists():
             try:

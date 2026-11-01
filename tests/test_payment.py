@@ -8,6 +8,7 @@ import unittest
 import cv2
 import numpy as np
 from urllib.parse import urlparse
+from unittest.mock import patch
 from playwright.sync_api import sync_playwright
 from payment import CampusQRCode, ExpectedOrder, PaymentError, amount
 
@@ -66,6 +67,18 @@ class QRTests(unittest.TestCase):
             <strong class="order-amount">¥ 15.00</strong>
             <input id="J_qrCode" type="hidden" value="{target}">'''
         return target
+    def test_payment_progress_is_reported_before_each_slow_request(self):
+        phases=[]
+        CampusQRCode(self.page,self.expected,direct=False).create(progress=lambda phase,message:phases.append(phase))
+        self.assertEqual(phases,['order_read','pay_request'])
+    def test_final_order_check_is_sent_before_cashier_loads(self):
+        self.prepare_alipay_page()
+        result=CampusQRCode(self.page,self.expected).create()
+        self.assertEqual(result['qr_kind'],'alipay_payment')
+        details=[i for i,(_,url) in enumerate(self.requests) if url.split('?')[0].endswith('/order/detail')]
+        cashier=next(i for i,(_,url) in enumerate(self.requests) if urlparse(url).hostname=='cashier.cc-pay.cn')
+        self.assertEqual(len(details),2)
+        self.assertLess(details[1],cashier)
     def test_returns_native_alipay_transaction_qr_without_account_login(self):
         target=self.prepare_alipay_page()
         result=CampusQRCode(self.page,self.expected).create()
@@ -76,6 +89,42 @@ class QRTests(unittest.TestCase):
         self.assertEqual(decoded,target)
         self.assertEqual(sum(method=='POST' for method,_ in self.requests),1)
         self.assertFalse(any('securityPost' in url or 'login' in url.lower() for _,url in self.requests))
+
+    def test_campus_entry_is_published_before_native_qr_finishes(self):
+        self.prepare_alipay_page();seen=[]
+        payer=CampusQRCode(self.page,self.expected)
+        original=payer.alipay_qr
+        def native(*args):
+            self.assertEqual(len(seen),1)
+            self.assertEqual(seen[0]['qr_kind'],'campus_cashier')
+            return original(*args)
+        with patch.object(payer,'alipay_qr',side_effect=native):
+            result=payer.create(update=seen.append)
+        self.assertEqual(result['qr_kind'],'alipay_payment')
+        self.assertEqual(seen[0]['qr_kind'],'campus_cashier')
+        self.assertEqual(sum(method=='POST' for method,_ in self.requests),1)
+
+    def test_payment_via_early_entry_is_not_reported_as_qr_failure(self):
+        self.prepare_alipay_page()
+        result=CampusQRCode(self.page,self.expected).create(
+            update=lambda entry:self.order.update(payStatus=2))
+        self.assertTrue(result['payment_confirmed'])
+        self.assertIsNone(result['qr_code'])
+        self.assertEqual(sum(method=='POST' for method,_ in self.requests),1)
+
+    def test_unverified_payment_response_is_never_published(self):
+        self.result['payFee']=16;seen=[]
+        with self.assertRaises(PaymentError):
+            CampusQRCode(self.page,self.expected).create(update=seen.append)
+        self.assertEqual(seen,[])
+
+    def test_paid_is_checked_again_after_one_second(self):
+        payer=CampusQRCode(self.page,self.expected);seen=[]
+        with patch.object(self.page,'wait_for_timeout',side_effect=lambda ms:self.order.update(payStatus=2)) as wait:
+            result=payer.wait_for_payment('2099-01-01T00:00:00+08:00',lambda status,**kw:seen.append(status))
+        wait.assert_called_once_with(1000)
+        self.assertEqual(result,'paid')
+        self.assertEqual(seen,['paid'])
     def test_native_qr_wrong_amount_or_target_falls_back_to_labelled_entry(self):
         for old,new in [('¥ 15.00','¥ 16.00'),('https://qr.alipay.com/','https://example.test/')]:
             with self.subTest(change=new):

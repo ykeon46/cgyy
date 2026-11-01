@@ -113,13 +113,15 @@ def read_credentials(config: dict) -> tuple[str, str]:
 
 
 def authenticated_client(browser, config: dict, user: str, password_loader, login_state: LoginState,
-                         *, ignore_password_warning: bool = False):
+                         *, ignore_password_warning: bool = False, progress=None):
     context = login_state.new_context(browser, user)
     try:
         page = context.new_page()
         page.set_default_timeout(60000)
         client = VenueClient(page, config)
+        client.login_progress = progress
         if login_state.loaded:
+            if progress:progress('正在恢复学校登录态，等待学校页面加载。')
             if client.resume_login(user):
                 login_state.save(context, user)
                 return context, client
@@ -129,6 +131,8 @@ def authenticated_client(browser, config: dict, user: str, password_loader, logi
             page = context.new_page()
             page.set_default_timeout(60000)
             client = VenueClient(page, config)
+            client.login_progress = progress
+        if progress:progress('正在连接学校统一认证。')
         password = password_loader()
         if not password:
             raise ReservationError('登录态缺失或已过期，请提供统一认证密码以重新登录。')
@@ -140,11 +144,46 @@ def authenticated_client(browser, config: dict, user: str, password_loader, logi
         raise
 
 
+DAY_INFO = '/api/reservation/day/info'
+
+
+class ResponseWaiter:
+    """先登记再触发请求，等待时不会漏掉在其他标签页等待期间已经到达的响应。"""
+    def __init__(self, page: Page, suffix: str):
+        self.page = page
+        self.suffix = suffix
+        self.responses = []
+        page.on('response', self.observe)
+
+    def matches(self, response) -> bool:
+        return urlparse(response.url).path.endswith(self.suffix)
+
+    def observe(self, response) -> None:
+        if self.matches(response):
+            self.responses.append(response)
+
+    def cancel(self) -> None:
+        try:
+            self.page.remove_listener('response', self.observe)
+        except (KeyError, ValueError):
+            pass
+
+    def wait(self, timeout: int):
+        try:
+            if not self.responses:
+                return self.page.wait_for_event('response', self.matches, timeout=timeout)
+            return self.responses[0]
+        finally:
+            self.cancel()
+
+
 class VenueClient:
     def __init__(self, page: Page, config: dict):
         self.page = page
         self.config = config
         self.read_deadline = None
+        self.navigating = False
+        self.pending_date = None
 
     @contextmanager
     def reading_until(self, deadline):
@@ -161,13 +200,17 @@ class VenueClient:
         remaining = int((self.read_deadline - time.monotonic()) * 1000)
         if remaining <= 0:
             raise BrowserTimeout('本轮查场时间预算已用完，未提交订单。')
-        return min(3000, remaining)
+        return min(30000, remaining)
 
     def resume_login(self, user: str) -> bool:
         started = time.monotonic()
         try:
-            self.page.goto(BASE_URL + '/venue/venue-introduce', wait_until='domcontentloaded', timeout=15000)
-            self.page.get_by_text('退出', exact=True).wait_for(timeout=5000)
+            self.page.goto(BASE_URL + '/venue/venue-introduce', wait_until='commit', timeout=30000)
+            # The SPA mounts before its account and venue data finish loading.
+            # Wait for the account state instead of a short-lived logout label.
+            self.page.wait_for_function('''user => [...document.querySelectorAll('*')].some(e =>
+                e.__vue__?.commonMethods?.emitAjax && String(e.__vue__?.userInfo?.username) === user)
+            ''', arg=user, timeout=30000)
             confirmed = self.check_session(user)
             if confirmed:
                 self.dismiss_notices()
@@ -182,17 +225,44 @@ class VenueClient:
         """只读核验当前页面登录态，不离开已准备的预约页面。"""
         try:
             return bool(self.page.evaluate('''user => new Promise(resolve => {
-                const timer = setTimeout(() => resolve(false), 5000);
+                const timer = setTimeout(() => resolve(false), 15000);
                 const done = result => { clearTimeout(timer); resolve(result); };
                 const element = [...document.querySelectorAll('*')].find(e =>
                     e.__vue__?.commonMethods?.emitAjax && e.__vue__?.userInfo?.username);
                 const vm = element?.__vue__;
                 if (!vm || String(vm.userInfo.username) !== user) return done(false);
-                vm.commonMethods.emitAjax({path:'/api/buddies', notPopUp:true,
+                vm.commonMethods.emitAjax({path:'/api/buddies', notPopUp:true, errorTipExecuteCallback:true,
                     success:() => done(true), error:() => done(false)});
             })''', user))
         except BrowserError:
             return False
+
+    def buddies(self, user: str):
+        """读取同伴列表，同时作为一次只读登录态核验；未登录或请求失败时返回 None。"""
+        try:
+            result = self.page.evaluate('''user => new Promise(resolve => {
+                const timer = setTimeout(() => resolve(null), 15000);
+                const done = value => { clearTimeout(timer); resolve(value); };
+                const element = [...document.querySelectorAll('*')].find(e =>
+                    e.__vue__?.commonMethods?.emitAjax && e.__vue__?.userInfo?.username);
+                const vm = element?.__vue__;
+                if (!vm || String(vm.userInfo.username) !== user) return done(null);
+                vm.commonMethods.emitAjax({path:'/api/buddies', notPopUp:true, errorTipExecuteCallback:true,
+                    success:data => done((Array.isArray(data) ? data : data?.content || []).map((buddy, index) =>
+                        ({index:index + 1, name:buddy.name || buddy.buddyName || ('同伴' + (index + 1))}))),
+                    error:() => done(null)});
+            })''', user)
+        except BrowserError:
+            return None
+        return result if isinstance(result, list) else None
+
+    def start_navigation(self, url: str) -> None:
+        """在新标签页发起跳转后立即返回，让多个场馆页面同时加载。"""
+        self.navigating = True
+        try:
+            self.page.evaluate('url => { location.href = url; }', url)
+        except BrowserError:
+            pass  # 跳转开始时执行上下文可能被销毁，属于正常情况。
 
     def dismiss_notices(self) -> None:
         for _ in range(4):
@@ -240,6 +310,8 @@ class VenueClient:
                     if not skipped:
                         if not warning_logged:
                             LOG.warning("等待统一认证网页的“本次忽略”按钮倒计时结束。")
+                            if getattr(self,'login_progress',None):
+                                self.login_progress('学校提示密码不安全，正在等待“本次忽略”按钮倒计时。')
                             warning_logged = True
                         if skip.is_visible() and skip.is_enabled():
                             skip.click(no_wait_after=True)
@@ -253,6 +325,10 @@ class VenueClient:
         raise ReservationError("登录超时，可能需要验证码、二次认证，或统一认证服务暂不可用。")
 
     def list_venues(self) -> list[str]:
+        if self.navigating:
+            self.navigating = False
+            self.page.wait_for_url(lambda url: urlparse(url).path.rstrip('/') == '/venue/venue-introduce',
+                                   wait_until='commit', timeout=self.read_timeout())
         # 使用网页自身导航，避免每次查询都重新加载整套前端资源。
         on_list = urlparse(self.page.url).path.rstrip("/") == "/venue/venue-introduce"
         navigation = self.page.locator(".tabItem").get_by_text("场地预约", exact=True)
@@ -261,68 +337,101 @@ class VenueClient:
             self.page.wait_for_url(re.compile(r'/venue/venue-introduce(?:[?#]|$)'), wait_until='domcontentloaded', timeout=self.read_timeout())
             self.page.locator('.reservationStep1:visible').wait_for(state='hidden', timeout=self.read_timeout())
         elif not on_list:
-            self.page.goto(BASE_URL + "/venue/venue-introduce", wait_until="domcontentloaded", timeout=self.read_timeout())
+            self.page.goto(BASE_URL + "/venue/venue-introduce", wait_until="commit", timeout=self.read_timeout())
         cards = self.page.locator(".place-item")
         cards.first.wait_for(timeout=self.read_timeout())
         self.dismiss_notices()
         return [name.strip() for name in cards.locator("h5").all_inner_texts()]
 
     def open_venue(self, names: list[str] | None = None) -> None:
+        self.begin_open_venue(names)
+        self.finish_open_venue()
+
+    def begin_open_venue(self, names: list[str] | None = None) -> None:
+        """点击“订场”后立即返回；等待在 finish_open_venue 中进行。"""
         names = self.list_venues() if names is None else names
         matches = [n for n in names if self.config["venue"].strip() in n]
         if len(matches) != 1:
             raise ReservationError(f"场馆名称匹配了 {len(matches)} 项，请用 --list-venues 查看完整名称。")
         heading = self.page.locator("h5").filter(has_text=re.compile(r"^\s*" + re.escape(matches[0]) + r"\s*$"))
         self.page.locator(".place-item").filter(has=heading).get_by_text("订场", exact=True).click(timeout=self.read_timeout())
+        self.opening = matches[0]
+
+    def finish_open_venue(self) -> None:
         self.page.locator(".reservationStep1").wait_for(timeout=self.read_timeout())
         self.page.locator("#scrollTable .reserveBlock").first.wait_for(timeout=self.read_timeout())
-        LOG.info("场馆：%s", matches[0])
+        LOG.info("场馆：%s", getattr(self, 'opening', self.config.get('venue')))
 
     def choose_date(self, desired: date) -> None:
+        self.begin_choose_date(desired)
+        self.finish_choose_date()
+
+    def begin_choose_date(self, desired: date) -> None:
+        """点击目标日期后立即返回；日期接口的响应由 finish_choose_date 核对。"""
+        self.pending_date = None
         dates = self.page.locator(".date_box > div")
         dates.first.wait_for(timeout=self.read_timeout())
-        label = f"{desired.month}月{desired.day}日"
-        target = dates.filter(has=self.page.locator("span").filter(has_text=re.compile("^" + re.escape(label) + "$")))
+        label = rf"^\s*0?{desired.month}月0?{desired.day}日\s*$"
+        target = dates.filter(has=self.page.locator("span").filter(has_text=re.compile(label)))
         if target.count() != 1:
             available = "; ".join(dates.all_inner_texts()).replace("\n", " ")
             raise ReservationError(f"{desired} 尚未开放或不在预约日期范围内。当前可选：{available}")
+        waiter = None
         if "active" not in (target.get_attribute("class") or "").split():
-            with self.page.expect_response(lambda r: urlparse(r.url).path.endswith("/api/reservation/day/info"), timeout=self.read_timeout()) as pending:
+            waiter = ResponseWaiter(self.page, DAY_INFO)
+            try:
                 target.click(timeout=self.read_timeout())
-            payload = pending.value.json()
-            if not pending.value.ok or not isinstance(payload, dict) or str(payload.get("code")) != "200":
+            except BaseException:
+                waiter.cancel()
+                raise
+        self.pending_date = (desired, target, waiter)
+
+    def finish_choose_date(self) -> None:
+        if self.pending_date is None:
+            raise ReservationError('尚未选择预约日期。')
+        desired, target, waiter = self.pending_date
+        self.pending_date = None
+        if waiter is not None:
+            response = waiter.wait(self.read_timeout())
+            payload = response.json()
+            if not response.ok or not isinstance(payload, dict) or str(payload.get("code")) != "200":
                 raise ReservationError("日期查询失败，请查看网站当前开放范围或重新登录。")
             expect(target).to_have_class(re.compile(r"\bactive\b"), timeout=self.read_timeout())
         self.page.locator("#scrollTable .reserveBlock").first.wait_for(timeout=self.read_timeout())
         LOG.info("日期：%s", desired)
 
     def refresh_availability(self) -> None:
+        self.finish_refresh(self.begin_refresh())
+
+    def begin_refresh(self) -> ResponseWaiter:
         # 调用网页刷新按钮使用的同一读取方法，让网站更新日期范围、余票及订单 token。
         # 不复用开放前的余票或 token，不直接构造下单请求。
-        with self.page.expect_response(lambda r: urlparse(r.url).path.endswith('/api/reservation/day/info'), timeout=self.read_timeout()) as pending:
+        waiter = ResponseWaiter(self.page, DAY_INFO)
+        try:
             found = self.page.locator('.reservationStep1').evaluate('''element => {
                 let vm = element.__vue__;
                 while (vm && typeof vm.getReserveDate !== 'function') vm = vm.$parent;
                 if (!vm) return false;
                 vm.getReserveDate(); return true;
             }''', timeout=self.read_timeout())
-            if not found:
-                raise ReservationError('未找到网页自身的余票刷新方法，请检查网页结构。')
-        response = pending.value
+        except BaseException:
+            waiter.cancel()
+            raise
+        if not found:
+            waiter.cancel()
+            raise ReservationError('未找到网页自身的余票刷新方法，请检查网页结构。')
+        return waiter
+
+    def finish_refresh(self, waiter: ResponseWaiter) -> None:
+        response = waiter.wait(self.read_timeout())
         payload = response.json()
         if not response.ok or not isinstance(payload, dict) or str(payload.get('code')) != '200':
             raise ReservationError('余票刷新失败，未提交订单。')
         self.page.locator('#scrollTable .reserveBlock').first.wait_for(timeout=self.read_timeout())
 
     def prepare_booking(self, desired: date) -> None:
-        self.open_venue()
-        try:
-            self.choose_date(desired)
-        except ReservationError as error:
-            if '尚未开放或不在预约日期范围内' not in str(error):
-                raise
-            LOG.info('目标日期尚未显示，开放后刷新网站日期范围。')
-        self.prepare_form()
+        if not prepare_venues([self], desired)[0]:
+            raise ReservationError('场馆页面准备失败。')
 
     def grid(self) -> list[dict]:
         # 只读取 DOM，不通过 Vue 私有对象修改预约数据。
@@ -428,7 +537,8 @@ class VenueClient:
         if agreement.count():
             agreement.check()
 
-    def submit(self, cells: list[dict], *, timeout: int = 15000, captcha_solver=None) -> dict:
+    def submit(self, cells: list[dict], *, timeout: int = 15000, captcha_solver=None, progress=None) -> dict:
+        report = progress or (lambda phase, message: None)
         started = time.monotonic()
         deadline = started + timeout / 1000
         now = datetime.now(CHINA)
@@ -451,12 +561,15 @@ class VenueClient:
                 if remaining <= 0:
                     raise ReservationError('选场准备已超过下单时间预算，未点击提交。')
                 received.clear()
+                report('captcha_load', '已选好场地，正在打开学校验证码。')
                 with self.page.expect_response(lambda r: urlparse(r.url).path.endswith("/api/reservation/order/submit"), timeout=remaining) as pending:
                     button.click(timeout=remaining)
                     if captcha_solver:
                         while not received and time.monotonic() < deadline:
                             if self.page.locator('.verifybox:visible').count():
+                                report('captcha_solve', '正在识别并点选验证码。')
                                 captcha_solver(self.page, timeout=max(1, int((deadline - time.monotonic()) * 1000)))
+                                report('order_confirm', '验证码已通过，正在等待学校确认订单。')
                                 break
                             self.page.wait_for_timeout(100)
                 response = pending.value
@@ -496,6 +609,82 @@ class VenueClient:
             raise ReservationError("未收到订单响应，请在网页核对订单或完成验证；不自动重试。 " + " ".join(notices)) from error
         finally:
             self.page.remove_listener('response', observe)
+
+
+def prepare_venues(clients: list[VenueClient], desired: date, *, raise_errors: bool = True,
+                   reopen: bool = True, progress=None) -> list[bool]:
+    """分阶段准备多个场馆标签页：先在所有标签页发起点击，再逐个等待。
+    网页请求在各标签页同时进行，总耗时接近最慢的一个场馆，而不是逐个相加。
+    reopen=False 用于已停在预约页的标签页，只切换日期并核对表单。"""
+    alive = list(range(len(clients)))
+    report = progress or (lambda phase, message: None)
+    errors = {}
+    def step(action):
+        for index in list(alive):
+            try:
+                action(clients[index])
+            except (ReservationError, BrowserError, AssertionError) as error:
+                if isinstance(error, ReservationError) and '尚未开放或不在预约日期范围内' in str(error):
+                    LOG.info('目标日期尚未显示，开放后刷新网站日期范围。')
+                    clients[index].pending_date = None
+                    continue
+                LOG.warning('%s 页面准备失败（%s）。', clients[index].config.get('venue'), type(error).__name__)
+                errors[index] = error
+                alive.remove(index)
+    if reopen:
+        report('open_venues', f'正在同时打开{len(clients)}个场馆的预约页面。')
+        step(lambda client: client.begin_open_venue())
+        step(lambda client: client.finish_open_venue())
+    report('choose_date', f'正在切换到{desired.month}月{desired.day}日的场次。')
+    step(lambda client: client.begin_choose_date(desired))
+    step(lambda client: client.finish_choose_date() if client.pending_date else None)
+    step(lambda client: client.prepare_form())
+    if raise_errors and len(clients) == 1 and errors:
+        raise errors[0]
+    return [index in alive for index in range(len(clients))]
+
+
+def on_reservation_page(client: VenueClient) -> bool:
+    """标签页仍停在可用的预约页面，可以直接复用。"""
+    try:
+        return (not client.page.is_closed()
+                and urlparse(client.page.url).path.startswith('/venue/venue-reservation')
+                and client.page.locator('.reservationStep1:visible').count() > 0)
+    except BrowserError:
+        return False
+
+
+def open_venue_tabs(base: VenueClient, config: dict, desired: date, *, progress=None):
+    """每个场馆一个标签页并同时加载到目标日期。第一个场馆使用 base 所在页面。
+    返回 ({场馆: 客户端}, 已就绪场馆集合)。"""
+    venues = config['venues']
+    clients = {venues[0]: base}
+    for venue in venues[1:]:
+        try:
+            page = base.page.context.new_page()
+            page.set_default_timeout(60000)
+            tab = VenueClient(page, {})
+            tab.start_navigation(BASE_URL + '/venue/venue-introduce')
+            clients[venue] = tab
+        except BrowserError:
+            LOG.warning('%s 标签页未能打开，查询时再加载。', venue)
+    return clients, load_venue_tabs(clients, config, desired, reopen=True, progress=progress)
+
+
+def load_venue_tabs(clients: dict, config: dict, desired: date, *, reopen: bool, progress=None) -> set:
+    for venue, client in clients.items():
+        client.config = dict(config, venue=venue)
+    names = list(clients)
+    deadline = time.monotonic() + 90
+    for client in clients.values():
+        client.read_deadline = deadline
+    try:
+        ready = prepare_venues([clients[venue] for venue in names], desired, raise_errors=False,
+                               reopen=reopen, progress=progress)
+    finally:
+        for client in clients.values():
+            client.read_deadline = None
+    return {venue for venue, ok in zip(names, ready) if ok}
 
 
 def available_choice(slots: list[dict], config: dict) -> list[dict]:

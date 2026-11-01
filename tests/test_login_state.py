@@ -93,6 +93,16 @@ class LoginStateBrowserTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.browser.close();cls.playwright.stop()
 
+    def test_school_contexts_use_the_browsers_own_identity_without_headless_marker(self):
+        context=LoginState(None).new_context(self.browser,'test-user')
+        try:
+            page=context.new_page()
+            agent=page.evaluate('navigator.userAgent')
+        finally:
+            context.close()
+        self.assertNotIn('Headless',agent)
+        self.assertIn('Chrome/'+self.browser.version.split('.')[0],agent)
+
     def test_round_trip_restores_cookie_and_local_storage(self):
         with tempfile.TemporaryDirectory() as directory:
             cache=LoginState(Path(directory)/'state.json')
@@ -121,4 +131,17 @@ class LoginStateBrowserTests(unittest.TestCase):
                 </script>'''))
             client=VenueClient(page,load_config(DEFAULT_CONFIG))
             self.assertFalse(client.resume_login('test-user'))
+        finally:context.close()
+
+    def test_slow_valid_session_without_logout_label_is_reused(self):
+        context=self.browser.new_context()
+        try:
+            page=context.new_page()
+            page.route('**/*',lambda route:route.fulfill(content_type='text/html',body='''
+                <div id="app"></div><script>
+                document.querySelector('#app').__vue__={userInfo:{username:'test-user'},
+                    commonMethods:{emitAjax:options=>setTimeout(()=>options.success({}),5500)}};
+                </script>'''))
+            client=VenueClient(page,load_config(DEFAULT_CONFIG))
+            self.assertTrue(client.resume_login('test-user'))
         finally:context.close()
